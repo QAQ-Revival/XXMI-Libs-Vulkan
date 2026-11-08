@@ -42,9 +42,9 @@ struct IniLine {
 	// line:
 	const wstring *ini_path;
 
-	IniLine(wstring &key, wstring &val, wstring &line, const wstring &ini_namespace, const wstring *ini_path) :
-		first(key),
-		second(val),
+	IniLine(wstring &&key, wstring &&val, const wstring &line, const wstring &ini_namespace, const wstring *ini_path) :
+		first(std::move(key)),
+		second(std::move(val)),
 		raw_line(line),
 		ini_namespace(ini_namespace),
 		ini_path(ini_path)
