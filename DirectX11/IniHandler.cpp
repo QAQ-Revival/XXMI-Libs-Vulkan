@@ -2160,6 +2160,17 @@ static CustomResource* ParseResourceSection(const wchar_t* section_name, const w
 		}
 	}
 
+	if (GetIniString(section_name, L"original_format", 0, setting, MAX_PATH)) {
+		custom_resource->original_format = ParseFormatString(setting, true);
+		if (custom_resource->original_format == (DXGI_FORMAT)-1) {
+			IniWarningW(L"Unknown original_format \"%ls\"\n - [%ls]\n", setting, section_name);
+		}
+		else {
+			LogInfo("  original_format=%s\n", TexFormatStr(custom_resource->override_format));
+		}
+	}
+	custom_resource->original_dhash = GetIniHash(section_name, L"original_dhash", 0, nullptr);
+
 	custom_resource->override_color_space = GetIniEnumClass(section_name, L"color_space", CustomColorSpace::DEFAULT, NULL, CustomColorSpaceNames);
 	custom_resource->override_width = GetIniInt(section_name, L"width", -1, NULL);
 	custom_resource->override_height = GetIniInt(section_name, L"height", -1, NULL);
@@ -5095,6 +5106,10 @@ void LoadConfigFile()
 	G->dx12_evict_idle = GetIniBool(L"Rendering", L"dx12_evict_idle", true, NULL);
 	G->dx12_evict_idle_seconds = max(0, GetIniInt(L"Rendering", L"dx12_evict_idle_seconds", 10, NULL));
 	G->dx12_evict_budget_percent = min(max(0, GetIniInt(L"Rendering", L"dx12_evict_budget_percent", 75, NULL)), 1000);
+
+	G->dhash_mip_size = GetIniInt(L"Rendering", L"dhash_mip_size", 256, NULL);
+	G->dhash_allow_rehash = GetIniBool(L"Rendering", L"dhash_allow_rehash", false, NULL);
+
 	if (GetIniStringAndLog(L"Rendering", L"override_directory", 0, G->SHADER_PATH, MAX_PATH))
 	{
 		while (G->SHADER_PATH[wcslen(G->SHADER_PATH) - 1] == L' ')

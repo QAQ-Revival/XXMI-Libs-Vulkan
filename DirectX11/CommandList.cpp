@@ -3878,6 +3878,9 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 		case ResourceCopyTargetEvaluationMode::RESOURCE_MIPS:
 			return texture_filter_target.GetResourceMips(state);
 
+		case ResourceCopyTargetEvaluationMode::RESOURCE_HAMMING_DISTANCE:
+			return texture_filter_target.GetResourceHammingDistance(state);
+
 		case ResourceCopyTargetEvaluationMode::RESOURCE_BIND_FLAGS:
 			return texture_filter_target.GetResourceBindFlags(state);
 
@@ -3898,6 +3901,16 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 			CustomResource* custom_resource = texture_filter_target.GetCustomResource(state);
 			if (custom_resource != nullptr)
 				return (float)custom_resource->source_stride;
+			else
+				// Return -1 for ResourceCopyTarget with non-custom resource
+				return -1.0f;
+		}
+
+		case ResourceCopyTargetEvaluationMode::RESOURCE_ORIGINAL_FORMAT:
+		{
+			CustomResource* custom_resource = texture_filter_target.GetCustomResource(state);
+			if (custom_resource != nullptr)
+				return (float)custom_resource->original_format;
 			else
 				// Return -1 for ResourceCopyTarget with non-custom resource
 				return -1.0f;
@@ -4023,6 +4036,23 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 
 float CommandListOperand::evaluate_shader_bindings(CommandListState *state, const ShaderBindings &bindings)
 {
+	// The declared slot ranges take no slot argument.
+	switch (shader_target.evaluation_mode)
+	{
+	case ShaderTargetEvaluationMode::DCL_CB_SLOT_COUNT:
+		return (float)bindings.constant_buffer_slots.count;
+	case ShaderTargetEvaluationMode::DCL_CB_FIRST_SLOT:
+		return bindings.constant_buffer_slots.count ? (float)bindings.constant_buffer_slots.first : -1.0f;
+	case ShaderTargetEvaluationMode::DCL_CB_LAST_SLOT:
+		return bindings.constant_buffer_slots.count ? (float)bindings.constant_buffer_slots.last : -1.0f;
+	case ShaderTargetEvaluationMode::DCL_SRV_SLOT_COUNT:
+		return (float)bindings.resource_slots.count;
+	case ShaderTargetEvaluationMode::DCL_SRV_FIRST_SLOT:
+		return bindings.resource_slots.count ? (float)bindings.resource_slots.first : -1.0f;
+	case ShaderTargetEvaluationMode::DCL_SRV_LAST_SLOT:
+		return bindings.resource_slots.count ? (float)bindings.resource_slots.last : -1.0f;
+	}
+
 	UINT slot_id = (UINT)shader_target.member_args[0].GetValue(state);
 
 	// Negative one means there is no such: the shader samples fewer textures.
@@ -5078,6 +5108,49 @@ inline bool ParseFloatToken(const wstring& input, float& out, size_t& length)
 	return true;
 }
 
+inline bool ParseHashToken(const wstring& input, uint64_t& out, size_t& length)
+{
+	out = 0;
+	length = 0;
+
+	const wchar_t* begin = input.c_str();
+	const wchar_t* p = begin;
+
+	// Optional 0x prefix.
+	if (p[0] == L'0' && (p[1] == L'x'))
+		p += 2;
+
+	uint64_t value = 0;
+	size_t digits = 0;
+
+	for (; *p; ++p)
+	{
+		unsigned int digit;
+
+		if (*p >= L'0' && *p <= L'9')
+			digit = *p - L'0';
+		else if (*p >= L'a' && *p <= L'f')
+			digit = *p - L'a' + 10;
+		else
+			break;
+
+		// Maximum 64-bit hash: 16 hexadecimal digits.
+		if (digits >= 16)
+			return false;
+
+		value = (value << 4) | digit;
+		++digits;
+	}
+
+	if (digits == 0)
+		return false;
+
+	out = value;
+	length = static_cast<size_t>(p - begin);
+
+	return true;
+}
+
 #pragma endregion CommandLexer
 
 
@@ -5248,6 +5321,28 @@ bool CommandArgumentReader::GetFloat(float* out)
 	ConsumeToken();
 
 	LogDebugW(L"  Float: '%ls'\n", token.c_str());
+
+	return true;
+}
+
+bool CommandArgumentReader::GetHash(uint64_t* out)
+{
+	wstring token;
+
+	if (!PeekToken(&token))
+		return false;
+
+	size_t len;
+
+	if (!ParseHashToken(token, *out, len) || len != token.size())
+	{
+		SetError(L"Invalid hash: " + token, m_peek_start_pos);
+		return false;
+	}
+
+	ConsumeToken();
+
+	LogDebugW(L"  Hash: '%ls'\n", token.c_str());
 
 	return true;
 }
@@ -9325,6 +9420,30 @@ bool SyntaxTarget::ParseMemberArguments(
 			break;
 		}
 
+		case MemberArg::Type::Hash:
+		{
+			uint64_t hash;
+
+			if (!args.GetHash(&hash))
+				return args.Fail();
+
+			member_args[i].constant_hash = hash;
+			member_args[i].type = MemberArg::Type::Hash;
+			break;
+		}
+
+		case MemberArg::Type::Resource:
+		{
+			auto resource = std::make_unique<ResourceCopyTarget>();
+
+			if (!args.GetTarget(resource.get(), true, CommandArgumentReader::PeekMode::Token, false, false))
+				return args.Fail();
+
+			member_args[i].resource = std::move(resource);
+			member_args[i].type = MemberArg::Type::Resource;
+			break;
+		}
+
 		case MemberArg::Type::Unsigned:
 		case MemberArg::Type::Signed:
 		case MemberArg::Type::Float:
@@ -9438,9 +9557,15 @@ IniParserResult ShaderTarget::ParseTargetMember(
 		{ L"->srv_sampled",    13, ShaderTargetEvaluationMode::DCL_SRV_SAMPLED, {{
 			MemberArg::Type::Unsigned, // Place in the order the code samples its textures
 		}} },
+		{ L"->cb_last_slot",   14, ShaderTargetEvaluationMode::DCL_CB_LAST_SLOT },
 		{ L"->srv_dimension",  15, ShaderTargetEvaluationMode::DCL_SRV_DIMENSION, {{
 			MemberArg::Type::Unsigned, // Slot ID
 		}} },
+		{ L"->cb_slot_count",  15, ShaderTargetEvaluationMode::DCL_CB_SLOT_COUNT },
+		{ L"->cb_first_slot",  15, ShaderTargetEvaluationMode::DCL_CB_FIRST_SLOT },
+		{ L"->srv_last_slot",  15, ShaderTargetEvaluationMode::DCL_SRV_LAST_SLOT },
+		{ L"->srv_slot_count", 16, ShaderTargetEvaluationMode::DCL_SRV_SLOT_COUNT },
+		{ L"->srv_first_slot", 16, ShaderTargetEvaluationMode::DCL_SRV_FIRST_SLOT },
 		{ L"->srv_original_format", 21, ShaderTargetEvaluationMode::DCL_SRV_ORIGINAL_FORMAT, {{
 			MemberArg::Type::Unsigned, // Slot ID
 		}} },
@@ -9521,6 +9646,10 @@ IniParserResult ResourceCopyTarget::ParseTargetMember(
 		{ L"->elementoffset", 15, ResourceCopyTargetEvaluationMode::LAYOUT_ELEMENT_OFFSET, {{
 			MemberArg::Type::String,  // Semantic Name
 			MemberArg::Type::Unsigned // Semantic Index
+		}} },
+		{ L"->originalformat",  16, ResourceCopyTargetEvaluationMode::RESOURCE_ORIGINAL_FORMAT },
+		{ L"->hammingdistance", 17, ResourceCopyTargetEvaluationMode::RESOURCE_HAMMING_DISTANCE, {{
+			MemberArg::Type::Resource,  // Texture Resource
 		}} },
 	};
 
@@ -12255,6 +12384,63 @@ float ResourceCopyTarget::GetResourceMips(CommandListState* state)
 	return ret;
 }
 
+inline unsigned HammingDistance(uint64_t a, uint64_t b)
+{
+	// Treat an all-zero dHash as maximally different from any non-zero dHash.
+	// A zero dHash is produced when:
+	// * All 64 luminance comparison operations produce zero bits.
+	// * The flat-color fallback produces an all-zero RGBA value.
+	// This safeguard prevents false near-matches between zero-hash images
+	// and non-zero hashes that differ in only a few bits.
+	if ((a == 0) != (b == 0))
+		return 64;
+
+	return static_cast<unsigned>(__popcnt64(a ^ b));
+}
+
+float ResourceCopyTarget::GetResourceHammingDistance(CommandListState* state)
+{
+	float ret = ResourcePropertyResult::UNKNOWN;
+
+	ID3D11View* view = nullptr;
+	ID3D11Resource* resource = GetResource(state, &view, nullptr, nullptr, nullptr, nullptr);
+
+	if (!resource)
+	{
+		ret = ResourcePropertyResult::RESOURCE_NOT_FOUND;
+		goto cleanup;
+	}
+
+	uint64_t resource_dhash = 0;
+	bool has_resource_dhash = GetDhash(state->mHackerContext, resource, G->dhash_mip_size, G->dhash_allow_rehash, resource_dhash, view);
+
+	if (has_resource_dhash)
+	{
+		auto* target_ptr = member_args[0].resource.get();
+
+		if (target_ptr)
+		{
+			CustomResource* custom_resource = target_ptr->GetCustomResource(state);
+
+			if (custom_resource)
+			{
+				const uint64_t reference_dhash = custom_resource->original_dhash;
+				ret = static_cast<float>(HammingDistance(reference_dhash, resource_dhash));
+			}
+		}
+	}
+
+cleanup:
+
+	if (resource)
+		resource->Release();
+
+	if (view)
+		view->Release();
+
+	return ret;
+}
+
 // Returns the D3D11_BIND_FLAGs of a resource.
 D3D11_BIND_FLAG ResourceCopyTarget::GetResourceBindFlags(CommandListState *state)
 {
@@ -14071,8 +14257,12 @@ void ResourceCopyOperation::CopyResourceToResource(
 		if (src.type == ResourceCopyTargetType::CUSTOM_RESOURCE) {
 			CustomResource* src_custom_resource = src.GetCustomResource(state);
 			dst_custom_resource->source_stride = src_custom_resource->source_stride > 0 ? src_custom_resource->source_stride : stride;
+			dst_custom_resource->original_dhash = src_custom_resource->original_dhash;
+			dst_custom_resource->original_format = src_custom_resource->original_format;
 		} else {
 			dst_custom_resource->source_stride = stride;
+			dst_custom_resource->original_dhash = 0;
+			dst_custom_resource->original_format = (DXGI_FORMAT)-1;
 		}
 	}
 
