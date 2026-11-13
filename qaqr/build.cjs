@@ -27,7 +27,7 @@ function build({ output = path.join(root, 'build/component'), work = path.join(r
   git(['archive', '--format=zip', '--output=' + path.join(output, 'source.zip'), 'HEAD']);
   const files = {};
   for (const name of fs.readdirSync(output).filter(name => name !== 'component.json')) files[name] = crypto.createHash('sha256').update(fs.readFileSync(path.join(output, name))).digest('hex');
-  fs.writeFileSync(path.join(output, 'component.json'), JSON.stringify({ source: 'https://github.com/QAQ-Revival/XXMI-Libs-Package', sourceCommit: git(['rev-parse', 'HEAD']), backend: 'vulkan', activityProtocol: 1, compatibleRuntimeHashes: require("./changes.json").compatibleRuntimeHashes, validation: 'D3D11 WARP', gameRuntimeValidated: false, files }, null, 2));
+  fs.writeFileSync(path.join(output, 'component.json'), JSON.stringify({ source: 'https://github.com/QAQ-Revival/XXMI-Libs-Vulkan', sourceCommit: git(['rev-parse', 'HEAD']), backend: 'vulkan', activityProtocol: 1, compatibleRuntimeHashes: require("./changes.json").compatibleRuntimeHashes, validation: 'D3D11 WARP', gameRuntimeValidated: false, files }, null, 2));
   return output;
 }
 if (require.main === module) build({ verifyOnly: process.argv.includes('--verify-only') });
