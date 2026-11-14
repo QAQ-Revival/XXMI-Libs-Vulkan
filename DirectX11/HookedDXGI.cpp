@@ -761,9 +761,8 @@ static HRESULT __stdcall Vtbl_CreateSwapChainForCoreWindow(IDXGIFactory2 *This, 
 	return create_swap_chain_for_core_window(fnVtblOrigCreateSwapChainForCoreWindow, This, pDevice, pWindow, pDesc, pRestrictToOutput, ppSwapChain);
 }
 
-// Not sure we actually care about anything using DirectComposition, but for
-// completeness do so anyway, since it is virtually identical to the last two
-// anyway, just with no window.
+// DirectComposition swap chains are hooked only to unwrap the device they
+// are created on; see below for why they are not wrapped themselves.
 
 HRESULT(__stdcall *fnOrigCreateSwapChainForComposition)(
 	IDXGIFactory2 * This,
@@ -798,47 +797,47 @@ static HRESULT create_swap_chain_for_composition(CreateSwapChainForComposition_t
 	}
 
 	HackerDevice *hackerDevice = NULL;
-	DXGI_SWAP_CHAIN_DESC1 descCopy = { 0 };
+	Dx12CommandQueue *dx12Queue = NULL;
 
 	LogInfo("*** Hooked IDXGIFactory2::CreateSwapChainForComposition(%p) called\n", This);
 	LogInfo("  Device = %p\n", pDevice);
 	LogInfo("  SwapChain = %p\n", ppSwapChain);
 	LogInfo("  Description1 = %p\n", pDesc);
+	if (pDesc)
+		LogInfo("  Width = %u, Height = %u\n", pDesc->Width, pDesc->Height);
 
-	// FIXME: Need the hWnd for mouse support
-
-	Dx12CommandQueue *dx12Queue = Dx12QueryProxy<Dx12CommandQueue>(pDevice);
+	// A composition swap chain has no window, so it is not what the game
+	// presents its frames with: it is a panel some other module in the
+	// process hands to DirectComposition (EFF's Ins panel does this from a
+	// thread of its own). It is created on the original device or queue and
+	// handed back unwrapped, with none of the display overrides applied and
+	// without touching the resolution Mods read: IDCompositionVisual::
+	// SetContent takes the swap chain apart by its private interfaces and
+	// faults on a HackerSwapChain, a wrapped one would run the frame's
+	// actions on that thread and, presenting first, make the bridge take the
+	// game for a D3D11 one, and a 604x640 panel is not the game's resolution.
+	// A device that is not ours goes through as it is.
+	dx12Queue = Dx12QueryProxy<Dx12CommandQueue>(pDevice);
 	if (dx12Queue) {
-		get_tls()->hooking_quirk_protection = true;
-		HRESULT hr = orig(This, dx12Queue->mOrig, pDesc, pRestrictToOutput, ppSwapChain);
-		get_tls()->hooking_quirk_protection = false;
-		return dx12_swap_chain_created(dx12Queue, hr, (IDXGISwapChain**)ppSwapChain);
+		pDevice = dx12Queue->mOrig;
+	} else {
+		hackerDevice = pDevice ? lookup_hacker_device(pDevice) : NULL;
+		if (hackerDevice)
+			pDevice = hackerDevice->GetPossiblyHookedOrigDevice1();
 	}
-
-	hackerDevice = sort_out_swap_chain_device_mess(&pDevice);
-	if (!hackerDevice) {
-		LogInfo("  Device is not ours, passing IDXGIFactory2::CreateSwapChainForComposition through untouched\n");
-		get_tls()->hooking_quirk_protection = true;
-		HRESULT hr = orig(This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
-		get_tls()->hooking_quirk_protection = false;
-		return hr;
-	}
-
-	override_factory2_swap_chain(&pDesc, &descCopy, NULL);
 
 	get_tls()->hooking_quirk_protection = true;
 	HRESULT hr = orig(This, pDevice, pDesc, pRestrictToOutput, ppSwapChain);
 	get_tls()->hooking_quirk_protection = false;
-	if (FAILED(hr))
-	{
+
+	if (SUCCEEDED(hr) && ppSwapChain)
+		LogInfo("->Composition swap chain %p left unwrapped, result %#x\n\n", *ppSwapChain, hr);
+	else
 		LogInfo("->Failed result %#x\n\n", hr);
-		goto out_release;
-	}
+	fflush(LogFile);
 
-	wrap_factory2_swap_chain(hackerDevice, ppSwapChain);
-
-	LogInfo("->return result %#x\n", hr);
-out_release:
+	if (dx12Queue)
+		dx12Queue->Release();
 	if (hackerDevice)
 		hackerDevice->Release();
 	return hr;
