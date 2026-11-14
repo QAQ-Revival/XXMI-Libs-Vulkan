@@ -18,6 +18,7 @@
 #include "SpirvPatchCache.h"
 #include "SpirvTools.h"
 #include "VkDump.h"
+#include "VkHooks.h"
 #include "VkScope.h"
 
 #include "../dx12/Bridge.h"
@@ -2031,7 +2032,7 @@ static bool budget_known;
 static bool memory_budget(VkPhysicalDeviceMemoryProperties2 *properties, VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget)
 {
 	static PFN_vkGetPhysicalDeviceMemoryProperties2 get_properties = (PFN_vkGetPhysicalDeviceMemoryProperties2)
-		GetProcAddress(GetModuleHandleW(L"vulkan-1.dll"), "vkGetPhysicalDeviceMemoryProperties2");
+		GetProcAddress(VkLoaderModule(), "vkGetPhysicalDeviceMemoryProperties2");
 
 	if (!budget_known || !get_properties || !mods_physical_device)
 		return false;

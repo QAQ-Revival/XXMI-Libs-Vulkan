@@ -866,6 +866,57 @@ static VkResult VKAPI_CALL Hooked_vkQueuePresentKHR(VkQueue queue, const VkPrese
 
 // -----------------------------------------------------------------------------
 
+static bool is_loader_name(HMODULE module)
+{
+	wchar_t path[MAX_PATH];
+	DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+	const wchar_t *name;
+
+	if (!length || length >= MAX_PATH)
+		return false;
+	name = wcsrchr(path, L'\\');
+	name = name ? name + 1 : path;
+	return !_wcsicmp(name, L"vulkan-1.dll");
+}
+
+HMODULE VkLoaderModule(bool reference)
+{
+	static HMODULE logged_proxy;
+	HMODULE named, real = NULL;
+	FARPROC get;
+
+	if (!GetModuleHandleExW(0, L"vulkan-1.dll", &named))
+		return NULL;
+
+	// For a forwarder GetProcAddress loads its module if it has to, and
+	// gives the address in it. An export something else redirected into a
+	// module of its own leads elsewhere, which is not the loader.
+	get = GetProcAddress(named, "vkGetInstanceProcAddr");
+	if (get && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)get, &real)) {
+		if (real == named || !is_loader_name(real)) {
+			FreeLibrary(real);
+			real = NULL;
+		}
+	}
+
+	if (!real) {
+		real = named;
+	} else {
+		if (InterlockedExchangePointer((void* volatile*)&logged_proxy, named) != named)
+			VkLogInfo("vulkan-1.dll at %p forwards to the Vulkan loader at %p, hooking that\n", named, real);
+		FreeLibrary(named);
+	}
+
+	// The loader stays in the process for as long as the game has it
+	// loaded: without a reference, the caller uses it as the hook library
+	// helpers did, which did not take one either.
+	if (!reference)
+		FreeLibrary(real);
+	return real;
+}
+
+// -----------------------------------------------------------------------------
+
 // A hook on an export of vulkan-1.dll. The loader can be unloaded and loaded
 // again, at the same address or another, which takes the hooks with it, and
 // whatever restores code that was changed can undo them.
@@ -1078,7 +1129,7 @@ static void hook_device_exports()
 	HMODULE vulkan;
 
 	// Kept loaded while its code is looked at
-	if (!GetModuleHandleExW(0, L"vulkan-1.dll", &vulkan))
+	if (!(vulkan = VkLoaderModule(true)))
 		return;
 	AcquireSRWLockExclusive(&export_hooks_lock);
 	device_exports_wanted = true;
@@ -1089,7 +1140,7 @@ static void hook_device_exports()
 
 static void register_device(VkDevice device, VkPhysicalDevice physical_device, bool external_memory, bool external_semaphore)
 {
-	HINSTANCE vulkan = NktHookLibHelpers::GetModuleBaseAddress(L"vulkan-1.dll");
+	HINSTANCE vulkan = VkLoaderModule();
 	PFN_vkGetDeviceProcAddr get = fnOrigGetDeviceProcAddr;
 	VkDispatch *slot = NULL;
 	VkFuncs next;
@@ -1233,7 +1284,7 @@ static VkBool32 VKAPI_CALL address_bound(VkDebugUtilsMessageSeverityFlagBitsEXT 
 static VkResult VKAPI_CALL Hooked_vkCreateInstance(const VkInstanceCreateInfo *info, const VkAllocationCallbacks *allocator,
 		VkInstance *instance)
 {
-	HINSTANCE vulkan = NktHookLibHelpers::GetModuleBaseAddress(L"vulkan-1.dll");
+	HINSTANCE vulkan = VkLoaderModule();
 	PFN_vkEnumerateInstanceExtensionProperties enumerate = (PFN_vkEnumerateInstanceExtensionProperties)
 		NktHookLibHelpers::GetProcedureAddress(vulkan, "vkEnumerateInstanceExtensionProperties");
 	PFN_vkGetInstanceProcAddr get = (PFN_vkGetInstanceProcAddr)NktHookLibHelpers::GetProcedureAddress(vulkan, "vkGetInstanceProcAddr");
@@ -1301,7 +1352,7 @@ static bool writable(const void *at, size_t bytes)
 static VkResult create_diagnosed(VkPhysicalDevice physical_device, const VkDeviceCreateInfo *info,
 		const VkAllocationCallbacks *allocator, VkDevice *device, bool diagnose, bool *fault, bool *checkpoints, bool *bindings)
 {
-	HINSTANCE vulkan = NktHookLibHelpers::GetModuleBaseAddress(L"vulkan-1.dll");
+	HINSTANCE vulkan = VkLoaderModule();
 	PFN_vkEnumerateDeviceExtensionProperties enumerate = (PFN_vkEnumerateDeviceExtensionProperties)
 		NktHookLibHelpers::GetProcedureAddress(vulkan, "vkEnumerateDeviceExtensionProperties");
 	PFN_vkGetPhysicalDeviceFeatures2 get_features = (PFN_vkGetPhysicalDeviceFeatures2)
@@ -1402,7 +1453,7 @@ static VkResult create_with_null_descriptor(VkPhysicalDevice physical_device, co
 		const VkAllocationCallbacks *allocator, VkDevice *device, bool diagnose, bool *null_descriptor,
 		bool *fault, bool *checkpoints, bool *bindings)
 {
-	HINSTANCE vulkan = NktHookLibHelpers::GetModuleBaseAddress(L"vulkan-1.dll");
+	HINSTANCE vulkan = VkLoaderModule();
 	PFN_vkEnumerateDeviceExtensionProperties enumerate = (PFN_vkEnumerateDeviceExtensionProperties)
 		NktHookLibHelpers::GetProcedureAddress(vulkan, "vkEnumerateDeviceExtensionProperties");
 	PFN_vkGetPhysicalDeviceFeatures2 get_features = (PFN_vkGetPhysicalDeviceFeatures2)
@@ -1475,7 +1526,7 @@ static VkResult create_device(VkPhysicalDevice physical_device, const VkDeviceCr
 		bool *robust, bool *null_descriptor, bool *fault, bool *checkpoints, bool *bindings)
 {
 	PFN_vkGetPhysicalDeviceFeatures get_features = (PFN_vkGetPhysicalDeviceFeatures)NktHookLibHelpers::GetProcedureAddress(
-		NktHookLibHelpers::GetModuleBaseAddress(L"vulkan-1.dll"), "vkGetPhysicalDeviceFeatures");
+		VkLoaderModule(), "vkGetPhysicalDeviceFeatures");
 	VkPhysicalDeviceFeatures supported = {}, enabled = {};
 	VkPhysicalDeviceFeatures2 *chained = NULL;
 	VkDeviceCreateInfo robust_info;
@@ -1573,7 +1624,7 @@ static VkResult VKAPI_CALL Hooked_vkCreateDevice(VkPhysicalDevice physical_devic
 	}
 	if (vk_mods_active) {
 		PFN_vkGetDeviceProcAddr get = fnOrigGetDeviceProcAddr ? fnOrigGetDeviceProcAddr : (PFN_vkGetDeviceProcAddr)
-			NktHookLibHelpers::GetProcedureAddress(NktHookLibHelpers::GetModuleBaseAddress(L"vulkan-1.dll"), "vkGetDeviceProcAddr");
+			NktHookLibHelpers::GetProcedureAddress(VkLoaderModule(), "vkGetDeviceProcAddr");
 
 		if (get) {
 			VkModsDiagnostics(*device,
@@ -1658,7 +1709,7 @@ void VkHookExports()
 	HMODULE vulkan;
 
 	// Kept loaded while its code is looked at
-	if (!GetModuleHandleExW(0, L"vulkan-1.dll", &vulkan))
+	if (!(vulkan = VkLoaderModule(true)))
 		return;
 	AcquireSRWLockExclusive(&export_hooks_lock);
 	hook_exports(vulkan);

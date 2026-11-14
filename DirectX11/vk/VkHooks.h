@@ -1,5 +1,7 @@
 #pragma once
 
+#include <windows.h>
+
 // A Vulkan game gets its functions from vulkan-1.dll, the loader: either its
 // exports, which vkGetInstanceProcAddr hands out as well, or what
 // vkGetDeviceProcAddr returns, which leads past those exports straight into
@@ -19,6 +21,14 @@
 // again since. Called from DllMain and from the LoadLibraryExW hook, so it
 // has to stay within what is permitted under the loader lock.
 void VkHookExports();
+// The Vulkan loader, or NULL when it is not in the process. A module named
+// vulkan-1.dll can be a proxy of it instead: EFF puts one next to the game
+// whose exports forward to "C:\Windows\System32\vulkan-1.vkXxx". The
+// proxy is what is found by name, the hook library cannot follow forwarders
+// given with a path, and the game's calls go to the real loader regardless,
+// so the loader is found where the proxy's vkGetInstanceProcAddr leads. With
+// reference, the caller is given a reference it has to FreeLibrary.
+HMODULE VkLoaderModule(bool reference = false);
 // Releases deferred Vulkan destroys when a D3D11 present rules out its mod path.
 void VkDisableModsForD3D11();
 // For DLL_PROCESS_DETACH: no more being told of vulkan-1.dll being unloaded
