@@ -52,6 +52,7 @@
     <ClCompile Include="DHash64Gpu.cpp" />
     <ClCompile Include="DLLMainHook.cpp" />
     <ClCompile Include="desktop\Channel.cpp" />
+    <ClCompile Include="desktop\DesktopOverlay.cpp" />
     <ClCompile Include="desktop\Protocol.cpp" />
     <ClCompile Include="dx12\Dx12Hooks.cpp" />
     <ClCompile Include="dx12\Dx12CommandList.cpp" />
@@ -73,6 +74,7 @@
     <ClCompile Include="dx12\DeviceRemoved.cpp" />
     <ClCompile Include="dx12\DrawPath.cpp" />
     <ClCompile Include="dx12\Dxc.cpp" />
+    <ClCompile Include="dx12\DxilPatch.cpp" />
     <ClCompile Include="dx12\DxilMetadata.cpp" />
     <ClCompile Include="dx12\PresentPass.cpp" />
     <ClCompile Include="dx12\ShimContext.cpp" />
@@ -135,6 +137,7 @@
     <ClInclude Include="dx12\ResourceTracker.h" />
     <ClInclude Include="dx12\TextureHash.h" />
     <ClInclude Include="desktop\Channel.h" />
+    <ClInclude Include="desktop\DesktopOverlay.h" />
     <ClInclude Include="desktop\Protocol.h" />
     <ClInclude Include="dx12\Dx12Hooks.h" />
     <ClInclude Include="dx12\Dx12CommandList.h" />
@@ -146,6 +149,7 @@
     <ClInclude Include="dx12\DeviceRemoved.h" />
     <ClInclude Include="dx12\DrawPath.h" />
     <ClInclude Include="dx12\Dxc.h" />
+    <ClInclude Include="dx12\DxilPatch.h" />
     <ClInclude Include="dx12\DxilMetadata.h" />
     <ClInclude Include="dx12\PresentPass.h" />
     <ClInclude Include="dx12\ShimContext.h" />

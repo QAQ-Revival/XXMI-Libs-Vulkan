@@ -308,11 +308,14 @@ static void frame_actions()
 		VkModsConfigReloaded();
 		Dx12WatchDevice(dx12_shim->device);
 	}
+	// Only once ReloadConfig has parsed the mods' ShaderRegex sections
+	if (G->gConfigInitialized)
+		dx12_config_loaded = true;
 
 	Profiling::Spike::sample_mod_state();
 
 	if (desktop_channel_enabled)
-		DesktopChannelFrame(vk_mods_active ? DesktopProtocol::RENDER_VULKAN : DesktopProtocol::RENDER_D3D12);
+		DesktopChannelFrame(NULL, NULL, vk_mods_active ? DesktopProtocol::RENDER_VULKAN : DesktopProtocol::RENDER_D3D12);
 
 	if (!G->suppress_overlay)
 		Dx12DrawOverlay();

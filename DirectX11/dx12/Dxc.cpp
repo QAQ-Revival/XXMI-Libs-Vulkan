@@ -16,6 +16,9 @@ static SRWLOCK lock = SRWLOCK_INIT;
 static bool tried;
 static IDxcCompiler3 *compiler;
 static IDxcUtils *utils;
+static IDxcAssembler *dxc_assembler;
+static IDxcValidator *dxc_validator;
+static DxcCreateInstanceProc create_instance;
 
 static bool load()
 {
@@ -55,6 +58,7 @@ static bool load()
 		utils = NULL;
 		return false;
 	}
+	create_instance = create;
 	Dx12DumpNote("Loaded %S\n", path);
 	return true;
 }
@@ -67,6 +71,131 @@ bool Dx12DxcAvailable()
 	available = load();
 	ReleaseSRWLockExclusive(&lock);
 	return available;
+}
+
+bool Dx12DxcDisassemble(const void *bytecode, size_t size, std::string *text, std::string *errors)
+{
+	DxcBuffer buffer = { bytecode, size, DXC_CP_ACP };
+	IDxcResult *result = NULL;
+	IDxcBlobUtf8 *disassembly = NULL, *diagnostics = NULL;
+	HRESULT hr, status = E_FAIL;
+	bool success = false;
+
+	text->clear();
+	errors->clear();
+	AcquireSRWLockExclusive(&lock);
+	if (!load()) {
+		errors->assign("the DXC compiler is not available");
+		goto out;
+	}
+	hr = compiler->Disassemble(&buffer, IID_PPV_ARGS(&result));
+	if (FAILED(hr) || !result) {
+		errors->assign("DXC could not disassemble the shader");
+		goto out;
+	}
+	result->GetStatus(&status);
+	if (SUCCEEDED(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&diagnostics), NULL)) && diagnostics && diagnostics->GetStringLength())
+		errors->assign(diagnostics->GetStringPointer(), diagnostics->GetStringLength());
+	if (FAILED(status) || FAILED(result->GetOutput(DXC_OUT_DISASSEMBLY, IID_PPV_ARGS(&disassembly), NULL)) || !disassembly) {
+		if (errors->empty())
+			errors->assign("DXC did not return a disassembly");
+		goto out;
+	}
+	text->assign(disassembly->GetStringPointer(), disassembly->GetStringLength());
+	success = true;
+
+out:
+	if (diagnostics)
+		diagnostics->Release();
+	if (disassembly)
+		disassembly->Release();
+	if (result)
+		result->Release();
+	ReleaseSRWLockExclusive(&lock);
+	return success;
+}
+
+bool Dx12DxcAssemble(const std::string &text, std::vector<BYTE> *bytecode, std::string *errors)
+{
+	IDxcBlobEncoding *source = NULL, *diagnostics = NULL;
+	IDxcBlob *object = NULL, *validated = NULL;
+	IDxcBlobEncoding *validation_diagnostics = NULL;
+	IDxcOperationResult *result = NULL, *validation = NULL;
+	HRESULT hr, status = E_FAIL;
+	bool success = false;
+
+	bytecode->clear();
+	errors->clear();
+	AcquireSRWLockExclusive(&lock);
+	if (!load()) {
+		errors->assign("the DXC compiler is not available");
+		goto out;
+	}
+	if (!dxc_assembler && (!create_instance || FAILED(create_instance(CLSID_DxcAssembler, IID_PPV_ARGS(&dxc_assembler))))) {
+		errors->assign("the DXC assembler is not available");
+		goto out;
+	}
+	if (!dxc_validator && (!create_instance || FAILED(create_instance(CLSID_DxcValidator, IID_PPV_ARGS(&dxc_validator))))) {
+		errors->assign("the DXIL validator is not available");
+		goto out;
+	}
+	hr = utils->CreateBlob(text.data(), (UINT32)text.size(), DXC_CP_UTF8, &source);
+	if (FAILED(hr) || !source) {
+		errors->assign("DXC could not read the disassembled text");
+		goto out;
+	}
+	hr = dxc_assembler->AssembleToContainer(source, &result);
+	if (FAILED(hr) || !result) {
+		errors->assign("DXC could not assemble the patched shader");
+		goto out;
+	}
+	result->GetStatus(&status);
+	if (FAILED(result->GetErrorBuffer(&diagnostics)) && FAILED(status))
+		diagnostics = NULL;
+	if (diagnostics && diagnostics->GetBufferSize())
+		errors->assign((const char*)diagnostics->GetBufferPointer(), diagnostics->GetBufferSize());
+	if (FAILED(status) || FAILED(result->GetResult(&object)) || !object) {
+		if (errors->empty())
+			errors->assign("DXC rejected the patched shader");
+		goto out;
+	}
+	hr = dxc_validator->Validate(object, DxcValidatorFlags_Default, &validation);
+	if (FAILED(hr) || !validation) {
+		errors->append("\nthe DXIL validator could not run");
+		goto out;
+	}
+	validation->GetStatus(&status);
+	if (SUCCEEDED(validation->GetErrorBuffer(&validation_diagnostics)) && validation_diagnostics
+	    && validation_diagnostics->GetBufferSize()) {
+		if (!errors->empty())
+			errors->push_back('\n');
+		errors->append((const char*)validation_diagnostics->GetBufferPointer(), validation_diagnostics->GetBufferSize());
+	}
+	if (FAILED(status) || FAILED(validation->GetResult(&validated)) || !validated) {
+		if (errors->empty())
+			errors->assign("the DXIL validator rejected the patched shader");
+		goto out;
+	}
+	bytecode->assign((const BYTE*)validated->GetBufferPointer(), (const BYTE*)validated->GetBufferPointer() + validated->GetBufferSize());
+	success = true;
+
+out:
+	if (validation_diagnostics)
+		validation_diagnostics->Release();
+	if (validated)
+		validated->Release();
+	if (validation)
+		validation->Release();
+	if (object)
+		object->Release();
+	if (diagnostics)
+		diagnostics->Release();
+	if (result)
+		result->Release();
+	if (source)
+		source->Release();
+	ReleaseSRWLockExclusive(&lock);
+	return success;
 }
 
 static std::wstring widen(const std::string &text)
@@ -83,14 +212,6 @@ static std::string narrow(const std::wstring &text)
 
 	WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), &utf8[0], (int)utf8.size(), NULL, NULL);
 	return utf8;
-}
-
-static std::wstring full_path(const std::wstring &path)
-{
-	wchar_t full[MAX_PATH];
-	DWORD length = GetFullPathNameW(path.c_str(), MAX_PATH, full, NULL);
-
-	return length && length < MAX_PATH ? std::wstring(full, length) : path;
 }
 
 // What the preprocessor takes for space within a directive
@@ -148,8 +269,8 @@ static std::string resolve_includes(const char *text, size_t size, const std::ws
 		if (file[0] == L'\\' || file[0] == L'/' || (file.size() > 1 && file[1] == L':'))
 			continue;
 		found = dir + file;
-		if (working_dir && GetFileAttributesW(found.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES)
-			found = full_path(file);
+		if (working_dir && GetFileAttributesW(long_path_for_open(found).c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(file.c_str()) != INVALID_FILE_ATTRIBUTES)
+			found = full_path_name(file);
 
 		// Quoted, for the compiler to take the path as it is
 		resolved.append(text + copied, name - 1 - copied);
@@ -199,7 +320,7 @@ public:
 		HRESULT hr;
 
 		*source = NULL;
-		if (_wfopen_s(&file, filename, L"rb") || !file)
+		if (_wfopen_s(&file, long_path_for_open(filename).c_str(), L"rb") || !file)
 			return E_FAIL;
 		fseek(file, 0, SEEK_END);
 		size = ftell(file);
@@ -225,7 +346,7 @@ bool Dx12DxcCompile(const char *source, size_t size, const wchar_t *path, const 
 {
 	std::vector<std::wstring> owned;
 	std::vector<const wchar_t*> args;
-	std::wstring file = full_path(path);
+	std::wstring file = full_path_name(path);
 	// -1 is D3DCompile's own include handler, which looks where 0 does
 	IncludeHandler includes(dir_of(file), G->recursive_include > 0);
 	std::string resolved = includes.resolve(source, size, file);

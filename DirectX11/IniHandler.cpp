@@ -378,6 +378,37 @@ static bool get_namespaced_section_path(const wchar_t *section, wstring *ret)
 	return _get_namespaced_section_path(&ini_sections, section, ret);
 }
 
+static const wstring &migoto_directory()
+{
+	static const wstring dir = [] {
+		vector<wchar_t> buf(32768);
+		DWORD len = GetModuleFileName(migoto_handle, buf.data(), (DWORD)buf.size());
+		wstring path(buf.data(), len < buf.size() ? len : 0);
+		size_t slash = path.rfind(L'\\');
+
+		return slash == wstring::npos ? wstring() : path.substr(0, slash + 1);
+	}();
+	return dir;
+}
+
+bool ResolveConfigFilePath(const wstring &namespace_path, const wchar_t *filename, wstring *path)
+{
+	const wstring &dir = migoto_directory();
+
+	path->clear();
+	if (dir.empty())
+		return false;
+
+	if (!namespace_path.empty()) {
+		*path = long_path_for_open(dir + namespace_path + filename);
+		if (GetFileAttributes(path->c_str()) != INVALID_FILE_ATTRIBUTES)
+			return true;
+	}
+
+	*path = long_path_for_open(dir + filename);
+	return true;
+}
+
 // Returns the section name re-namespaced with the path of the ini file that
 // declared it, lower cased. Only succeeds for sections of files that overrode
 // their namespace, since the result would otherwise equal the section name.
@@ -683,7 +714,7 @@ static bool ReadIniText(const wchar_t *path, wstring *text)
 	DWORD got = 0;
 	bool ok;
 
-	HANDLE f = CreateFile(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	HANDLE f = CreateFile(long_path_for_open(path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 			NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
 	if (f == INVALID_HANDLE_VALUE)
 		return false;
@@ -848,7 +879,7 @@ static void ParseIniFilesRecursive(wchar_t *migoto_path, const wstring &rel_path
 	// in a case insensitive manner, then process the matching files &
 	// directories in the same order every time
 
-	hFind = FindFirstFile(search_path.c_str(), &find_data);
+	hFind = FindFirstFile(long_path_for_open(search_path).c_str(), &find_data);
 	if (hFind == INVALID_HANDLE_VALUE) {
 		LogInfo("    Recursive include path \"%S\" not found\n", search_path.c_str());
 		return;
@@ -2115,24 +2146,12 @@ static CustomResource* ParseResourceSection(const wchar_t* section_name, const w
 		// If this section was not in the main d3dx.ini, look
 		// for a file relative to the config it came from
 		// first, then try relative to the 3DMigoto directory:
-		wstring namespace_path;
+		wstring namespace_path, path;
 		get_namespaced_section_path(section_name, &namespace_path);
-		bool found = false;
-		wchar_t path[MAX_PATH];
-		if (!namespace_path.empty()) {
-			GetModuleFileName(migoto_handle, path, MAX_PATH);
-			wcsrchr(path, L'\\')[1] = 0;
-			wcscat(path, namespace_path.c_str());
-			wcscat(path, setting);
-			if (GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES)
-				found = true;
-		}
-		if (!found) {
-			GetModuleFileName(migoto_handle, path, MAX_PATH);
-			wcsrchr(path, L'\\')[1] = 0;
-			wcscat(path, setting);
-		}
-		custom_resource->filename = path;
+		if (ResolveConfigFilePath(namespace_path, setting, &path))
+			custom_resource->filename = path;
+		else
+			LogOverlay(LOG_DIRE, "ParseResourceSection: cannot find the 3DMigoto directory\n");
 	}
 
 	custom_resource->override_type = GetIniEnumClass(section_name, L"type", CustomResourceType::INVALID, NULL, CustomResourceTypeNames);
@@ -3088,6 +3107,48 @@ static bool parse_shader_regex_spirv_group(const std::wstring *section_id, Shade
 	return true;
 }
 
+// Keep InsertDeclarations as the original D3D11 lines for groups that also
+// have Pattern subsections, and collect Texture1D and Texture2D SRVs for DXIL.
+static bool parse_shader_regex_dxil_group(const std::wstring *section_id, ShaderRegexGroup *regex_group)
+{
+	if (regex_group->spirv()) {
+		IniWarningW(L"A ShaderRegex group cannot contain both SpirvPattern and DxilPattern subsections\n - [%ls]\n", section_id->c_str());
+		return false;
+	}
+	for (const std::string &model : regex_group->shader_models) {
+		if (!_strnicmp(model.c_str(), "cs_", 3)) {
+			IniWarningW(L"DXIL ShaderRegex currently supports graphics shaders only\n - [%ls]\n", section_id->c_str());
+			return false;
+		}
+	}
+
+	regex_group->dxil_declarations.clear();
+	for (const std::string &line : regex_group->declarations) {
+		DxilDeclaration declaration;
+		bool texture = !_strnicmp(line.c_str(), "texture2d", 9) || !_strnicmp(line.c_str(), "dcl_resource_texture2d", 22)
+			|| !_strnicmp(line.c_str(), "texture1d", 9) || !_strnicmp(line.c_str(), "dcl_resource_texture1d", 22);
+
+		bool raw_uav = !_strnicmp(line.c_str(), "dcl_uav_raw", 11);
+		bool sampler = !_strnicmp(line.c_str(), "dcl_sampler", 11);
+		if (!texture && !raw_uav && !sampler)
+			continue;
+		if (!parse_dxil_declaration(line, &declaration)) {
+			IniWarningW(L"A DXIL declaration must name a supported register, not: %S\n - [%ls]\n",
+				line.c_str(), section_id->c_str());
+			return false;
+		}
+		if (!regex_group->patterns.empty() && (!_strnicmp(line.c_str(), "texture2d ", 10) || !_strnicmp(line.c_str(), "texture1d ", 10))) {
+			IniWarningW(L"A group with legacy Pattern subsections must use D3D11 declaration syntax in InsertDeclarations\n - [%ls]\n",
+				section_id->c_str());
+			return false;
+		}
+		if (std::none_of(regex_group->dxil_declarations.begin(), regex_group->dxil_declarations.end(),
+				[&](const DxilDeclaration &other) { return other.reg == declaration.reg && other.uav == declaration.uav && other.sampler == declaration.sampler; }))
+			regex_group->dxil_declarations.push_back(declaration);
+	}
+	return true;
+}
+
 static void ParseShaderRegexSections()
 {
 	IniSections::iterator lower, upper, i;
@@ -3156,6 +3217,9 @@ static void ParseShaderRegexSections()
 				} else if (!fast_wcsnicmp(subsection_names[1].c_str(), L"SpirvPattern", 12)) {
 					if (parse_shader_regex_section_pattern(section_id, &subsection_names[1], regex_group, &regex_group->spirv_patterns))
 						continue;
+				} else if (!fast_wcsnicmp(subsection_names[1].c_str(), L"DxilPattern", 11)) {
+					if (parse_shader_regex_section_pattern(section_id, &subsection_names[1], regex_group, &regex_group->dxil_patterns))
+						continue;
 				} else if (!fast_wcsicmp(subsection_names[1].c_str(), L"InsertDeclarations")) {
 					if (parse_shader_regex_section_declarations(section_id, &subsection_names[1], regex_group))
 						continue;
@@ -3170,6 +3234,10 @@ static void ParseShaderRegexSections()
 				 && !fast_wcsicmp(subsection_names[2].c_str(), L"Replace")) {
 					if (parse_shader_regex_section_replace(section_id, &subsection_names[1], &regex_group->spirv_patterns))
 						continue;
+				} else if (!fast_wcsnicmp(subsection_names[1].c_str(), L"DxilPattern", 11)
+				 && !_wcsicmp(subsection_names[2].c_str(), L"Replace")) {
+					if (parse_shader_regex_section_replace(section_id, &subsection_names[1], &regex_group->dxil_patterns))
+						continue;
 				}
 				break;
 		}
@@ -3183,16 +3251,30 @@ static void ParseShaderRegexSections()
 	}
 
 	shader_regex_d3d_groups = false;
+	shader_regex_dxil_groups = false;
 	for (j = shader_regex_groups.begin(); j != shader_regex_groups.end();) {
-		std::wstring regex_id = j->first;
+		auto current = j++;
+		std::wstring regex_id = current->first;
+		bool valid = true;
 
-		if (!j->second.spirv()) {
+		if (current->second.spirv() && current->second.dxil()) {
+			IniWarningW(L"A ShaderRegex group cannot contain both SpirvPattern and DxilPattern subsections\n - [%ls]\n", regex_id.c_str());
+			valid = false;
+		} else if (current->second.spirv()) {
+			valid = parse_shader_regex_spirv_group(&regex_id, &current->second);
+		} else if (current->second.dxil()) {
+			valid = parse_shader_regex_dxil_group(&regex_id, &current->second);
+			if (valid) {
+				shader_regex_dxil_groups = true;
+				dx12_keep_shader_bytecode = true;
+			}
+			if (valid && !current->second.patterns.empty())
+				shader_regex_d3d_groups = true;
+		} else {
 			shader_regex_d3d_groups = true;
-			j++;
-			continue;
 		}
-		j++;
-		if (!parse_shader_regex_spirv_group(&regex_id, &shader_regex_groups[regex_id])) {
+
+		if (!valid) {
 			IniWarningW(L"Disabling entire shader regex group\n - [%ls]\n", regex_id.c_str());
 			delete_regex_group(&regex_id);
 		}
