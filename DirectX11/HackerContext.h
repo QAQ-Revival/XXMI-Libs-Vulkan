@@ -163,6 +163,8 @@ private:
 	HackerInputLayout* mOriginalInputLayout;
 	HackerInputLayout* mOverrideInputLayout;
 
+	InitialTexturesSnapshot mInitialTexturesSnapshot;
+
 	// Used for deny_cpu_read, track_texture_updates and constant buffer matching
 	// What this context has mapped and tracks, one entry a subresource,
 	// which is rarely more than one at a time and comes and goes with every
@@ -409,6 +411,7 @@ public:
 
 	unsigned GetDrawNumber() const { return draw_number; };
 	unsigned GetDispatchNumber() const { return dispatch_number; };
+	unsigned GetCallNumber() const { return draw_number + dispatch_number; };
 	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; };
 
 	// public to allow CommandList access, see mCheckTextureOverrideResults:
@@ -506,6 +509,7 @@ public:
 		for (UINT i = first; i < first + count && i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++)
 			slots[i >> 6] &= ~(1ull << (i & 63));
 	}
+	InitialTexturesSnapshot& GetInitialTexturesSnapshot() { return mInitialTexturesSnapshot; }
 
 	HRESULT ComputeDHash(ID3D11Texture2D* texture, UINT mipLevel, DXGI_FORMAT srvFormat, uint64_t& outHash);
 
