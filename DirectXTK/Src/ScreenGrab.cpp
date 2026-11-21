@@ -303,7 +303,6 @@ HRESULT DirectX::SaveDDSTextureToFile( ID3D11DeviceContext* pContext,
         break;
     }
 
-    // Get top-level mip layout.
     size_t rowPitch = 0;
     size_t slicePitch = 0;
     size_t rowCount = 0;
@@ -341,13 +340,11 @@ HRESULT DirectX::SaveDDSTextureToFile( ID3D11DeviceContext* pContext,
     if ( !pixels )
         return E_OUTOFMEMORY;
 
-    // Write DDS header.
     hr = writeFile( fileHeader, headerSize );
 
     if ( FAILED(hr) )
         return hr;
 
-    // Write all mip levels.
     for ( UINT mip = 0; mip < mip_levels; ++mip )
     {
         const UINT mipWidth = std::max<UINT>( 1, desc.Width >> mip );
@@ -362,11 +359,9 @@ HRESULT DirectX::SaveDDSTextureToFile( ID3D11DeviceContext* pContext,
         if ( !mipSlicePitch || !mipRowPitch || !mipRowCount )
             return E_FAIL;
 
-        // Validate destination buffer bounds and tightly packed layout.
         if ( mipSlicePitch > slicePitch || mipRowCount > mipSlicePitch / mipRowPitch || mipRowCount * mipRowPitch != mipSlicePitch )
             return E_FAIL;
 
-        // Map the corresponding staging subresource.
         const UINT subresource = D3D11CalcSubresource( mip, 0, desc.MipLevels);
 
         D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -396,14 +391,12 @@ HRESULT DirectX::SaveDDSTextureToFile( ID3D11DeviceContext* pContext,
 
         pContext->Unmap( pStaging.Get(), subresource );
 
-        // Write tightly packed mip data.
         hr = writeFile( pixels.get(), mipSlicePitch );
 
         if ( FAILED(hr) )
             return hr;
     }
 
-    // Keep the completed file.
     delonfail.clear();
 
     return S_OK;

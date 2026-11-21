@@ -1,6 +1,6 @@
 {
   "upstream": "myparsleycat/XXMI-Libs-Package-Forked",
-  "reviewedUpstream": "7090a601c7b9e72ba82bb0d470663a3ddbf22cf4",
+  "reviewedUpstream": "d7e3795a8e0face95509ad9fc20a1c0e96fa4ad5",
   "activityProtocol": 1,
   "changes": [
     "Net-change persistence journal and atomic compaction on reload",

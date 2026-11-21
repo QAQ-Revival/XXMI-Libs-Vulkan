@@ -4900,6 +4900,11 @@ void VkModsSubmitted(VkQueue queue, const VkCommandBuffer *cmds, size_t count)
 	Dx12ShimUnlock();
 }
 
+bool VkModsHaveDevice()
+{
+	return mods_device != NULL;
+}
+
 bool VkModsCountFrames()
 {
 	if (!frames_by_submission)

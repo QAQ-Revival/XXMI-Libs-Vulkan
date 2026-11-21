@@ -525,6 +525,7 @@ struct Globals
 	bool dx12_evict_idle;
 	UINT dx12_evict_idle_seconds;
 	UINT dx12_evict_budget_percent;
+	UINT dx12_defer_upload_hash;
 	bool vk_dump_hashes;
 	bool vk_buffers_first;
 	bool vk_cache_patched_shaders;
@@ -544,6 +545,12 @@ struct Globals
 	int texture_hash_version;
 	int dhash_mip_size = 0;
 	bool dhash_allow_rehash = false;
+	// Which mips of each Texture2D hold uploaded data, for picking the mip
+	// a dhash is computed from: needed by ps-t[Filter] lines, by
+	// ->HammingDistance and by the dhash written in frame analysis logs.
+	// Never switched back off: uploads made while it was off are not
+	// tracked, and their textures would never get a dhash
+	bool track_texture_subresources = false;
 	int EXPORT_HLSL;		// 0=off, 1=HLSL only, 2=HLSL+OriginalASM, 3= HLSL+OriginalASM+recompiledASM
 	bool EXPORT_SHADERS, EXPORT_FIXED, EXPORT_BINARY, CACHE_SHADERS, SCISSOR_DISABLE;
 	int track_texture_updates;
@@ -794,6 +801,7 @@ struct Globals
 		dx12_evict_idle(true),
 		dx12_evict_idle_seconds(10),
 		dx12_evict_budget_percent(75),
+		dx12_defer_upload_hash(1),
 		vk_dump_hashes(false),
 		vk_buffers_first(false),
 		vk_cache_patched_shaders(true),

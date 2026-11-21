@@ -172,15 +172,6 @@ private:
 	// which unlike a map allocate nothing once they have grown:
 	std::vector<ID3D11Resource*> mMappedResources;
 	std::vector<MappedResourceInfo> mMappedResourceInfos;
-
-	// The memory a small mapping was diverted to, kept for the next one of
-	// the same size: one block a size, for sizes that are multiples of 16
-	// (as those of constant buffers are):
-	static const size_t DIVERT_REUSE_MAX = 4096;
-	void *mDivertSpares[DIVERT_REUSE_MAX / 16 + 1];
-	void* AllocDiverted(size_t size);
-	void FreeDiverted(void *data, size_t size);
-
 	size_t FindMappedResource(ID3D11Resource *resource, UINT subresource) const
 	{
 		for (size_t i = 0; i < mMappedResources.size(); i++) {
@@ -190,7 +181,15 @@ private:
 		return mMappedResources.size();
 	}
 
+	// The memory a small mapping was diverted to, kept for the next one of
+	// the same size: one block a size, for sizes that are multiples of 16
+	// (as those of constant buffers are):
+	static const size_t DIVERT_REUSE_MAX = 4096;
+	void *mDivertSpares[DIVERT_REUSE_MAX / 16 + 1];
+	void* AllocDiverted(size_t size);
+	void FreeDiverted(void *data, size_t size);
 	DHash64Gpu mDHasher;
+	bool mDHashUnavailable = false;
 
 	unsigned draw_number;
 	unsigned dispatch_number;
@@ -390,6 +389,9 @@ public:
 	// What that shader declares at its registers, where that is known
 	// without a D3D11 object: for a draw of a Vulkan game. NULL otherwise.
 	const struct ShaderBindings* Dx12CurrentShaderBindings(wchar_t shader_type);
+	// The context over the D3D12 shim, whose game textures have no
+	// D3D11 resource to read
+	bool IsDx12ShimContext() const;
 
 	HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pContext1);
 	~HackerContext();
@@ -412,7 +414,8 @@ public:
 	unsigned GetDrawNumber() const { return draw_number; };
 	unsigned GetDispatchNumber() const { return dispatch_number; };
 	unsigned GetCallNumber() const { return draw_number + dispatch_number; };
-	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; };
+	// The snapshot is keyed by call number, which starts over each frame
+	void ResetCallCounters() { draw_number = 0; dispatch_number = 0; mInitialTexturesSnapshot.Clear(); };
 
 	// public to allow CommandList access, see mCheckTextureOverrideResults:
 	void NoteCheckTextureOverrideResult(const CheckTextureOverrideCommand *command, const DrawCallInfo *call_info, const TextureOverrideMatches &matches)

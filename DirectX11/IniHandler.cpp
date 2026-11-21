@@ -5233,6 +5233,8 @@ void LoadConfigFile()
 	G->dx12_evict_idle = GetIniBool(L"Rendering", L"dx12_evict_idle", true, NULL);
 	G->dx12_evict_idle_seconds = max(0, GetIniInt(L"Rendering", L"dx12_evict_idle_seconds", 10, NULL));
 	G->dx12_evict_budget_percent = min(max(0, GetIniInt(L"Rendering", L"dx12_evict_budget_percent", 75, NULL)), 1000);
+	// 2 defers every upload, for testing the deferred path where uploads read fast
+	G->dx12_defer_upload_hash = min(max(0, GetIniInt(L"Rendering", L"dx12_defer_upload_hash", 1, NULL)), 2);
 
 	G->dhash_mip_size = GetIniInt(L"Rendering", L"dhash_mip_size", 256, NULL);
 	G->dhash_allow_rehash = GetIniBool(L"Rendering", L"dhash_allow_rehash", false, NULL);
@@ -5441,6 +5443,8 @@ void LoadConfigFile()
 
 	// Must be done before any command lists that may refer to them:
 	ParseFilterSections();
+	if (G->hunting != HUNTING_MODE_DISABLED)
+		G->track_texture_subresources = true;
 	ParseResourceSections();
 
 	// Second pass for the Constants command list:
