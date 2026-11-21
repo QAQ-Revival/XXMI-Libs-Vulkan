@@ -1,6 +1,5 @@
 {
-  "upstream": "myparsleycat/XXMI-Libs-Package-Forked",
-  "reviewedUpstream": "d7e3795a8e0face95509ad9fc20a1c0e96fa4ad5",
+  "upstream": "SpectrumQT/XXMI-Libs-Package",
   "activityProtocol": 1,
   "changes": [
     "Net-change persistence journal and atomic compaction on reload",
@@ -9,15 +8,14 @@
     "Preserve legacy REF view end-boundary behavior for QAQR compatibility",
     "Distinguish compatible resource reuse from creation failure so repeated buffer and texture copies keep executing",
     "Convert structured compute output to valid plain vertex/index buffers for ShapeKey menus, preserving out-of-band stride and failure guards",
-    "The Vulkan and D3D12 present path publishes the activity channel and saves through the persistence journal",
-    "The journal writes the keys persistent_variable_key selects",
-    "REF views keep the end boundary of the DX11 build, so switching backends does not resize a view",
+    "Share one GPU resource between [Resource] sections whose files are identical (share_duplicate_resources, default on; written, render target, UAV and pool resources keep their own copy), ported from the Vulkan branch",
     "A config reload keeps the GPU resource of every [Resource] file that is unchanged (same file ID, size, write and change time) and loaded the same way, instead of reading and uploading every Mod again; resources of renamed-away, changed or unused files are released",
+    "A config reload with unchanged ShaderRegex sections relinks each shader's matched groups and reuses its patched shader instead of reading the cache files and creating it again",
+    "The ShaderRegex cache hash covers whole lines (lengths were in characters, not bytes), so editing the end of a pattern or replacement no longer keeps a stale cached patch",
     "Faster config parsing with identical results: ini files read in one go with the old stream's decoding rules, ASCII case folding without per-character locale lookups, and the command list optimiser collapsing else-if chains in one pass",
-    "A DirectComposition swap chain (no window, such as EFF's Ins panel) is handed back unwrapped with no display overrides, so DirectComposition can take it, and only the swap chain of the game's window sets res_width and res_height",
-    "The Vulkan loader is found where vulkan-1.dll's vkGetInstanceProcAddr leads, so its exports are hooked when a proxy of the same name (EFF) forwards to it by full path"
+    "A DirectComposition swap chain (no window, such as EFF's Ins panel) is handed back unwrapped with no display overrides, so DirectComposition can take it, and only the swap chain of the game's window sets res_width and res_height"
   ],
-  "validation": "Isolated D3D11 WARP processes; the Vulkan path has no check without a game",
+  "validation": "Isolated D3D11 WARP processes; no game is launched or injected",
   "compatibleRuntimeHashes": [
     "ea97846af4610b9af42beddccd7f22a5e73e85b25669cd4391ea8000962fdd7d",
     "a540f5d5ec838f3f1777b0f93a0207eb4783e42738ad703d8b7d64e04fa241c4",
