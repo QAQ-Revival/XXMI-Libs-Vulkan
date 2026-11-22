@@ -960,8 +960,8 @@ static void update_reaches()
 			readback->Release();
 		spare_readbacks.clear();
 	}
-	buffer_cache_generation++;
-	kept = reaches.size() <= REACH_KEPT;
+	const size_t count = reaches.size();
+	kept = count <= REACH_KEPT;
 	for (auto j = reaches.begin(); j != reaches.end();) {
 		if (j->second.state != REACH_PENDING && !(kept && j->second.state == REACH_KNOWN)
 		    && dx12_frame - j->second.frame > 600)
@@ -969,6 +969,8 @@ static void update_reaches()
 		else
 			++j;
 	}
+	if (reaches.size() != count)
+		buffer_cache_generation++;
 }
 
 // What publish_resource and remember_texture came to for a resource, which a
@@ -1672,7 +1674,8 @@ static View* new_game_view(Published *entry)
 
 static void forget_unused_published()
 {
-	buffer_cache_generation++;
+	const size_t count = published.size();
+
 	for (auto i = published.begin(); i != published.end();) {
 		if (dx12_frame - i->second.frame > 600) {
 			release_published(&i->second);
@@ -1681,6 +1684,8 @@ static void forget_unused_published()
 			++i;
 		}
 	}
+	if (published.size() != count)
+		buffer_cache_generation++;
 }
 
 // -----------------------------------------------------------------------------
@@ -2313,7 +2318,7 @@ static void restore_overrides()
 	const Dx12CmdState *game = &scope->list->mState;
 	const Dx12RootArguments *arguments = scope->compute ? &game->compute : &game->graphics;
 	ID3D12GraphicsCommandList *list = scope->list->mOrig;
-	UINT slot;
+	unsigned long first;
 
 	for (const ChangedParameter &changed : scope->parameters) {
 		if (changed.type == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE && scope->heaps_changed)
@@ -2323,10 +2328,16 @@ static void restore_overrides()
 	}
 	scope->parameters.clear();
 
-	for (slot = 0; scope->vbs_changed; slot++, scope->vbs_changed >>= 1) {
-		if (scope->vbs_changed & 1)
-			list->IASetVertexBuffers(slot, 1, &game->vertex_buffers[slot]);
+	UINT slots = scope->vbs_changed;
+	while (_BitScanForward(&first, slots)) {
+		UINT end = first;
+		do {
+			slots &= slots - 1;
+			end++;
+		} while (end < ARRAYSIZE(game->vertex_buffers) && (slots & (1u << end)));
+		list->IASetVertexBuffers(first, end - first, &game->vertex_buffers[first]);
 	}
+	scope->vbs_changed = 0;
 	if (scope->ib_changed)
 		list->IASetIndexBuffer(game->index_buffer.BufferLocation ? &game->index_buffer : NULL);
 	scope->ib_changed = false;
@@ -3778,6 +3789,8 @@ static void rebuild_skin_filter()
 
 static void forget_unused_skin_outputs()
 {
+	bool removed = false;
+
 	for (auto j = skin_outputs.begin(); j != skin_outputs.end();) {
 		if (dx12_frame - j->second.frame > 600) {
 			if (j->second.buffer)
@@ -3785,11 +3798,13 @@ static void forget_unused_skin_outputs()
 			if (j->second.spare)
 				j->second.spare->Release();
 			j = skin_outputs.erase(j);
+			removed = true;
 		} else {
 			++j;
 		}
 	}
-	rebuild_skin_filter();
+	if (removed)
+		rebuild_skin_filter();
 }
 
 // A constant buffer holding nothing but a number of vertices. There are as
@@ -5740,7 +5755,20 @@ static bool ini_params_reach_shaders(const Dx12RootSignatureInfo *signature)
 // times it was in them, and the sum of those stamps. While the counters come
 // to that sum the entries would say the same of the same buffers, see
 // DrawMemo.
-const UINT DRAW_MEMO_COUNTERS = 14;
+const UINT DRAW_MEMO_BUFFERS = 4;
+const UINT DRAW_MEMO_COUNTERS = 14 + DRAW_MEMO_BUFFERS + 1;
+
+struct DrawBufferRange {
+	ID3D12Resource *resource;
+	UINT64 offset, bytes;
+};
+
+struct DrawBufferRanges {
+	DrawBufferRange ranges[2 * DRAW_MEMO_BUFFERS + 1];
+	UINT count;
+	bool complete;
+};
+
 struct DrawStamps {
 	const volatile LONG64 *counters[DRAW_MEMO_COUNTERS];
 	BYTE times[DRAW_MEMO_COUNTERS];
@@ -5749,7 +5777,24 @@ struct DrawStamps {
 	// Not if a buffer was not answered for by its cache entry, or the
 	// counters are more than there is room for
 	bool whole;
+	DrawBufferRanges buffers;
 };
+
+static void add_draw_buffer_range(DrawBufferRanges *buffers, ID3D12Resource *resource, UINT64 offset, UINT64 bytes)
+{
+	if (!buffers->complete)
+		return;
+	for (UINT i = 0; i < buffers->count; i++) {
+		const DrawBufferRange &range = buffers->ranges[i];
+		if (range.resource == resource && range.offset == offset && range.bytes == bytes)
+			return;
+	}
+	if (buffers->count == ARRAYSIZE(buffers->ranges)) {
+		buffers->complete = false;
+		return;
+	}
+	buffers->ranges[buffers->count++] = { resource, offset, bytes };
+}
 
 static void add_draw_stamp_counters(DrawStamps *stamps, const volatile LONG64 *const *counters, UINT count)
 {
@@ -5779,31 +5824,38 @@ static void add_draw_stamp_counters(DrawStamps *stamps, const volatile LONG64 *c
 // when the entry was found to go by them
 static void add_draw_stamps(DrawStamps *stamps, const BufferCacheEntry *cached, UINT64 stamp)
 {
-	const volatile LONG64 *counters[2 + 17];
+	const UINT hash_counters = 17;
+	const volatile LONG64 *counters[DX12_VA_STAMP_COUNTERS + hash_counters];
 	UINT count;
 
 	if (!stamps->whole)
 		return;
 
 	Dx12FindBufferStampCounters(cached->va, counters);
-	count = Dx12BufferHashStampCounters(cached->resource, cached->offset, cached->span, counters + 2, 17);
+	count = Dx12BufferHashStampCounters(cached->resource, cached->offset, cached->span,
+		counters + DX12_VA_STAMP_COUNTERS, hash_counters);
 	if (!count) {
 		stamps->whole = false;
 		return;
 	}
-	add_draw_stamp_counters(stamps, counters, 2 + count);
+	add_draw_stamp_counters(stamps, counters, DX12_VA_STAMP_COUNTERS + count);
+	add_draw_buffer_range(&stamps->buffers, cached->resource, cached->offset, cached->span);
 
 	if (cached->ib_asked) {
 		Dx12FindBufferStampCounters(cached->ib_va, counters);
 		count = 0;
 		if (cached->ib_found) {
-			count = Dx12BufferHashStampCounters(cached->ib, cached->ib_offset, cached->ib_span, counters + 2, 17);
+			count = Dx12BufferHashStampCounters(cached->ib, cached->ib_offset, cached->ib_span,
+				counters + DX12_VA_STAMP_COUNTERS, hash_counters);
 			if (!count) {
 				stamps->whole = false;
 				return;
 			}
+			add_draw_buffer_range(&stamps->buffers, cached->ib, cached->ib_offset, cached->ib_span);
+		} else {
+			stamps->buffers.complete = false;
 		}
-		add_draw_stamp_counters(stamps, counters, 2 + count);
+		add_draw_stamp_counters(stamps, counters, DX12_VA_STAMP_COUNTERS + count);
 	}
 	stamps->total += stamp;
 }
@@ -5833,8 +5885,11 @@ static SlowReason buffer_is_boring(const Dx12ListBufferWrites *writes, UINT64 va
 		// away does not change what the buffer is.
 		if (!cached.generation || cached.config != config_generation)
 			break;
-		if (list_wrote(writes, &cached))
+		if (list_wrote(writes, &cached)) {
+			if (stamps)
+				stamps->whole = false;
 			return unhashed_buffer_is_boring(writes, va, bytes, kind) ? SLOW_NOT : SLOW_VB_CHANGED;
+		}
 		if (!cached.boring)
 			return SLOW_VB_WANTED;
 		if (!buffer_cache_stamp(&cached, &stamp))
@@ -5872,7 +5927,6 @@ static SlowReason buffer_is_boring(const Dx12ListBufferWrites *writes, UINT64 va
 // the frame before, with the same vertex and index buffers, and asking the
 // cache for each of those is most of what a draw not stopped for costs. So
 // what the entries of all of them went by is kept together, by what was asked.
-const UINT DRAW_MEMO_BUFFERS = 4;
 struct DrawMemoKey {
 	UINT64 vb_va[DRAW_MEMO_BUFFERS];
 	// As bound, which the vertex buffers are asked with: 0 without one
@@ -5899,6 +5953,8 @@ struct alignas(64) DrawMemo {
 };
 const UINT DRAW_MEMO_WAYS = 2;
 static DrawMemo draw_memos[8192];
+// Published under the corresponding memo's sequence. Only lists with writes need it.
+static DrawBufferRanges draw_memo_ranges[ARRAYSIZE(draw_memos)];
 
 static DrawMemo* draw_memo_bucket(const DrawMemoKey *key, UINT64 *tag)
 {
@@ -5914,7 +5970,7 @@ static DrawMemo* draw_memo_bucket(const DrawMemoKey *key, UINT64 *tag)
 
 // Without the lock: whether the buffers asked were found boring before with
 // nothing they went by changed since
-static bool draw_memo_holds(const DrawMemoKey *key)
+static bool draw_memo_holds(const DrawMemoKey *key, const Dx12ListBufferWrites *writes)
 {
 	DrawMemo memo, *slot;
 	UINT64 tag, total;
@@ -5937,7 +5993,20 @@ static bool draw_memo_holds(const DrawMemoKey *key)
 		total = 0;
 		for (i = 0; i < memo.count; i++)
 			total += (UINT64)*(const volatile LONG64*)((const BYTE*)draw_memos + memo.counters[i]) * memo.times[i];
-		return total == memo.total;
+		if (total != memo.total)
+			return false;
+		if (writes->recorded.empty())
+			return true;
+
+		DrawBufferRanges buffers = draw_memo_ranges[slot - draw_memos];
+		if (slot->seq != seq || !buffers.complete || buffers.count > ARRAYSIZE(buffers.ranges))
+			return false;
+		for (i = 0; i < buffers.count; i++) {
+			const DrawBufferRange &range = buffers.ranges[i];
+			if (Dx12ListWroteBuffer(writes, range.resource, range.offset, range.bytes))
+				return false;
+		}
+		return true;
 	}
 	return false;
 }
@@ -5969,6 +6038,10 @@ static void remember_draw(const DrawMemoKey *key, const DrawStamps *stamps)
 		slot->times[i] = stamps->times[i];
 	}
 	slot->key = *key;
+	DrawBufferRanges &buffers = draw_memo_ranges[slot - draw_memos];
+	buffers.count = stamps->buffers.count;
+	buffers.complete = stamps->buffers.complete;
+	memcpy(buffers.ranges, stamps->buffers.ranges, buffers.count * sizeof(*buffers.ranges));
 	InterlockedExchange(&slot->seq, seq + 2);
 }
 
@@ -6050,6 +6123,8 @@ static SlowReason draw_is_boring(Dx12GraphicsCommandList *list, const Dx12Pipeli
 	stamps.count = 0;
 	stamps.total = 0;
 	stamps.whole = true;
+	stamps.buffers.count = 0;
+	stamps.buffers.complete = true;
 
 	signature = Dx12ListRootSignature(list, false);
 	if (signature && ini_params_reach_shaders(signature))
@@ -6073,11 +6148,7 @@ static SlowReason draw_is_boring(Dx12GraphicsCommandList *list, const Dx12Pipeli
 		memo_key.vb_slots |= 1u << slot;
 		memo_buffers++;
 	}
-	// The memo is of the buffers as all lists left them, which the list's
-	// own copies may not have
-	if (!list->mBufferWrites.recorded.empty())
-		stamps.whole = false;
-	if (!stamps.whole || !draw_memo_holds(&memo_key)) {
+	if (!stamps.whole || !draw_memo_holds(&memo_key, &list->mBufferWrites)) {
 		for (vbs = worked_out.vbs & pipeline->vb_slots; _BitScanForward(&slot, vbs); vbs &= vbs - 1) {
 			if (slot >= ARRAYSIZE(game->vertex_buffers) || !game->vertex_buffers[slot].BufferLocation)
 				continue;
