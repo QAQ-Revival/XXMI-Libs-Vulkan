@@ -881,6 +881,19 @@ ResourceHandleInfo* GetResourceHandleInfo(ID3D11Resource *resource)
 {
 	std::unordered_map<ID3D11Resource *, ResourceHandleInfo>::iterator j;
 	ResourceHandleInfo* ret = NULL;
+	TLS::ResourceHandleCacheEntry *entry = &get_tls()->resource_handle_cache[
+		((uint64_t)(uintptr_t)resource * 0x9E3779B97F4A7C15ull) >> (64 - TLS::RESOURCE_HANDLE_CACHE_BITS)];
+	// Read before the lookup: an erase bumps it under the lock first, so
+	// an entry found before the erase is cached as stale already
+	unsigned generation = G->resource_erase_generation;
+
+	if (entry->resource == resource && entry->generation == generation) {
+		if (Profiling::mode == Profiling::Mode::SUMMARY) {
+			Profiling::texture_handle_info_lookup_overhead.count++;
+			Profiling::texture_handle_info_lookup_overhead.hits++;
+		}
+		return entry->info;
+	}
 
 	EnterCriticalSectionPretty(&G->mResourcesLock);
 
@@ -890,6 +903,11 @@ ResourceHandleInfo* GetResourceHandleInfo(ID3D11Resource *resource)
 
 	LeaveCriticalSection(&G->mResourcesLock);
 
+	if (ret) {
+		entry->resource = resource;
+		entry->info = ret;
+		entry->generation = generation;
+	}
 	return ret;
 }
 
@@ -1827,6 +1845,7 @@ ULONG STDMETHODCALLTYPE ResourceReleaseTracker::Release(void)
 		//                                                        //
 		////////////////////////////////////////////////////////////
 		EnterCriticalSectionPretty(&G->mResourcesLock);
+		G->resource_erase_generation++;
 		G->mResources.erase(resource);
 		LeaveCriticalSection(&G->mResourcesLock);
 		delete this;
@@ -2283,12 +2302,29 @@ static inline std::atomic<ID3D11Resource*>* texture_override_miss_slot(ID3D11Res
 	return &texture_override_miss_cache[slot >> (64 - TEXTURE_OVERRIDE_MISS_CACHE_BITS)];
 }
 
-void ForgetTextureOverrideMiss(ID3D11Resource *resource)
-{
-	std::atomic<ID3D11Resource*> *slot = texture_override_miss_slot(resource);
+// The same for resources without fuzzy (match_*) candidates, which the region
+// hash path asks about for every buffer it hashes by region even when the
+// resource has hash matches. Fuzzy candidates depend on the description, the
+// handle info being there and the TextureOverride sections, so the entries
+// are forgotten at the same points as those above.
+static std::atomic<ID3D11Resource*> fuzzy_texture_override_miss_cache[1 << TEXTURE_OVERRIDE_MISS_CACHE_BITS];
 
+static inline std::atomic<ID3D11Resource*>* fuzzy_texture_override_miss_slot(ID3D11Resource *resource)
+{
+	uint64_t slot = (uint64_t)(uintptr_t)resource * 0x9E3779B97F4A7C15ull;
+	return &fuzzy_texture_override_miss_cache[slot >> (64 - TEXTURE_OVERRIDE_MISS_CACHE_BITS)];
+}
+
+static void forget_miss(std::atomic<ID3D11Resource*> *slot, ID3D11Resource *resource)
+{
 	if (resource && slot->load(std::memory_order_relaxed) == resource)
 		slot->compare_exchange_strong(resource, nullptr);
+}
+
+void ForgetTextureOverrideMiss(ID3D11Resource *resource)
+{
+	forget_miss(texture_override_miss_slot(resource), resource);
+	forget_miss(fuzzy_texture_override_miss_slot(resource), resource);
 }
 
 // A view is of the same resource for as long as it exists, yet asking it which
@@ -2449,6 +2485,8 @@ void InvalidateTextureOverrideCandidates()
 
 	for (auto &slot : texture_override_miss_cache)
 		slot.store(nullptr);
+	for (auto &slot : fuzzy_texture_override_miss_cache)
+		slot.store(nullptr);
 }
 
 // match_lower_mip_textures: a copy keeps the data hash of what it was copied
@@ -2535,6 +2573,13 @@ void find_fuzzy_texture_overrides_for_resource(ID3D11Resource *resource, Texture
 	if (G->mFuzzyTextureOverrides.empty())
 		return;
 
+	std::atomic<ID3D11Resource*> *miss_slot = fuzzy_texture_override_miss_slot(resource);
+	if (miss_slot->load(std::memory_order_relaxed) == resource) {
+		if (Profiling::mode == Profiling::Mode::SUMMARY)
+			Profiling::texture_override_candidates_lookup_overhead.count++;
+		return;
+	}
+
 	Profiling::State profiling_state;
 	size_t matches_before = 0;
 	if (Profiling::mode == Profiling::Mode::SUMMARY) {
@@ -2551,6 +2596,8 @@ void find_fuzzy_texture_overrides_for_resource(ID3D11Resource *resource, Texture
 				matches->push_back(to);
 		}
 	}
+	if (!candidates || candidates->fuzzy_matches.empty())
+		miss_slot->store(resource, std::memory_order_relaxed);
 	LeaveCriticalSection(&G->mCriticalSection);
 
 	if (Profiling::mode == Profiling::Mode::SUMMARY) {

@@ -239,6 +239,9 @@ private:
 		// shader that really runs in place of this one, which reloading changes:
 		ID3D11DeviceChild *buffer_srv_slots_shader;
 		UINT64 buffer_srv_slots[2];
+		// mShaderBindingsCache for hash, filled in by BoundShaderInfo() when
+		// it first finds it. Its entries are never replaced or taken out:
+		const struct ShaderBindings *bindings;
 	} mShaderHandleCache[1 << SHADER_HANDLE_CACHE_BITS];
 	const ShaderHandleCacheEntry* LookupShaderHandle(ID3D11DeviceChild *shader);
 
@@ -392,6 +395,12 @@ public:
 	// What that shader declares at its registers, where that is known
 	// without a D3D11 object: for a draw of a Vulkan game. NULL otherwise.
 	const struct ShaderBindings* Dx12CurrentShaderBindings(wchar_t shader_type);
+	// What G->mShaderOverrideMap and G->mShaderBindingsCache have for the
+	// hash of a shader the game created, looked up through the caches of
+	// this context. False if the shader has no hash. Either output may be
+	// NULL when not needed.
+	bool BoundShaderInfo(ID3D11DeviceChild *shader, struct ShaderOverride **shader_override,
+			const struct ShaderBindings **bindings);
 	// The context over the D3D12 shim, whose game textures have no
 	// D3D11 resource to read
 	bool IsDx12ShimContext() const;
@@ -441,6 +450,22 @@ public:
 	// NULL unless the command has run before during this draw call and
 	// nothing may have bound to its slot since. The result does not outlive
 	// the next command that runs, copy the matches before running theirs:
+	// Whether command lists run with call_info belong to the draw call in
+	// progress, from the start of BeforeDraw() to the end of AfterDraw():
+	bool InDrawCommandLists(const DrawCallInfo *call_info) const
+	{
+		return call_info && call_info == mCheckTextureOverrideResultsDraw;
+	}
+	// The output views bound while the command lists of the draw call in
+	// progress run, as the output filters (o0, od) first read them. Held
+	// without references, as they stay bound until something binds others:
+	// whatever binds output views on this context forgets them, and so
+	// does the start and end of each draw call.
+	ID3D11RenderTargetView *mDrawOutputRtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+	ID3D11DepthStencilView *mDrawOutputDsv;
+	bool mDrawOutputRtvsKnown, mDrawOutputDsvKnown;
+	void ForgetDrawOutputViews() { mDrawOutputRtvsKnown = mDrawOutputDsvKnown = false; }
+
 	const CheckTextureOverrideResult* FindCheckTextureOverrideResult(const CheckTextureOverrideCommand *command, const DrawCallInfo *call_info) const
 	{
 		if (!call_info || call_info != mCheckTextureOverrideResultsDraw)

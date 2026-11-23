@@ -8,10 +8,10 @@
 //             [key=VK] [keyframe=N] [uploads=60] [churn=1] [table=4] [heap=N]
 //             [video] [planes=N] [streaming=N [streaming-count=K]] [buffers=N [buffer-count=K] [buffer-bytes=B]]
 //             [gpu-upload] [upload-queue=copy]
-//             [dxil] [no-srv] [rootconst] [debug] [threads=1] [rereach=K] [contend]
+//             [dxil] [no-srv] [rootconst] [debug] [threads=1] [rereach=K] [contend] [generated=N]
 //             [profile | profile=present] [test [move | evict [evictstop=N] | lowmip]]
 //             [scene=file [slot=vb0] [appear=N]]
-// Prints the average frame time of the frames after the first 300, in blocks.
+// Prints the median frame time of the frames after the first 300.
 //   dump=file.bmp  the last frame as a picture and its checksum
 //   capture=N,...  report pictures at these zero-based frames without BMP files
 //   key=VK         a key press the shim sees at frame keyframe
@@ -30,6 +30,9 @@
 //   dxil           the game's shaders compiled to DXIL (dxcompiler.dll next to it)
 //   rootconst      root constants in the root signature
 //   threads=1      passes after the first recorded on a thread of their own
+//   generated=N    N more presents after each frame's, without draws, as frame
+//                  generation adds, from frame GENERATED_FROM on: the present
+//                  after the one that loads the mods runs [Present] as a frame
 //   test           the meshes and textures that Mods/test.ini looks for (check.sh)
 //   move, evict    with test: see move_test and evict_test below
 //   lowmip         with test: see lowmip_test below
@@ -59,6 +62,7 @@
 #include <limits.h>
 #include "../common/crc.h"
 #include "../common/window.h"
+#include "../common/isolate.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -87,6 +91,8 @@ static UINT rereach;
 // time, as a game streaming in its world does
 static bool contend;
 static std::atomic<bool> contend_stop;
+static UINT generated_presents;
+const UINT GENERATED_FROM = 100;
 static std::atomic<UINT> contend_rounds;
 static bool test;
 // move (with test): the positions of mesh A are moved by copies between
@@ -1312,11 +1318,9 @@ int main(int argc, char **argv)
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv;
 	IDXGIFactory4 *factory;
 	IDXGISwapChain1 *swap_chain1;
-	LARGE_INTEGER freq, start, now, block_start;
-	std::vector<double> blocks;
+	LARGE_INTEGER freq, start;
 	LARGE_INTEGER t0, t1, t2;
-	INT64 record_ticks = 0, present_ticks = 0;
-	UINT timed_frames = 0;
+	std::vector<double> frame_ms, record_ms, present_ms;
 	std::atomic<UINT> gpu_cursor{ 0 };
 	HWND hwnd;
 	MSG message;
@@ -1406,6 +1410,7 @@ int main(int argc, char **argv)
 		else if (!strncmp(argv[a], "appear=", 7)) appear_frames = atoi(argv[a] + 7);
 		else if (!strncmp(argv[a], "rereach=", 8)) rereach = atoi(argv[a] + 8);
 		else if (!strcmp(argv[a], "contend")) contend = true;
+		else if (!strncmp(argv[a], "generated=", 10)) generated_presents = atoi(argv[a] + 10);
 		else {
 			printf("unknown argument %s\n", argv[a]);
 			return 1;
@@ -1616,7 +1621,8 @@ int main(int argc, char **argv)
 
 	QueryPerformanceFrequency(&freq);
 	QueryPerformanceCounter(&start);
-	block_start = start;
+	isolate_frame_thread();
+	MachineLoad timed_load = machine_load_now();
 
 	LARGE_INTEGER previous_end;
 	QueryPerformanceCounter(&previous_end);
@@ -2225,6 +2231,8 @@ int main(int argc, char **argv)
 		if (profile_present && f >= 300)
 			profiling = true;
 		CHECK(swap_chain->Present(0, DXGI_PRESENT_ALLOW_TEARING));
+		for (UINT g = 0; f >= GENERATED_FROM && g < generated_presents; g++)
+			CHECK(swap_chain->Present(0, DXGI_PRESENT_ALLOW_TEARING));
 		frame->fence = signal();
 		if (profile_present)
 			profiling = false;
@@ -2242,19 +2250,17 @@ int main(int argc, char **argv)
 			appearances.back().ms[slot] += (t2.QuadPart - previous_end.QuadPart) * 1000.0 / freq.QuadPart;
 			appearances.back().record[slot] += (t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart;
 		}
-		previous_end = t2;
 		if (f >= 300) {
-			record_ticks += t1.QuadPart - t0.QuadPart;
-			present_ticks += t2.QuadPart - t1.QuadPart;
-			timed_frames++;
+			frame_ms.push_back((t2.QuadPart - previous_end.QuadPart) * 1000.0 / freq.QuadPart);
+			record_ms.push_back((t1.QuadPart - t0.QuadPart) * 1000.0 / freq.QuadPart);
+			present_ms.push_back((t2.QuadPart - t1.QuadPart) * 1000.0 / freq.QuadPart);
 		}
+		previous_end = t2;
 
-		if (f >= 300 && (f - 300) % 500 == 499) {
-			QueryPerformanceCounter(&now);
-			blocks.push_back((now.QuadPart - block_start.QuadPart) * 1000.0 / freq.QuadPart / 500);
-			block_start = now;
-		} else if (f == 299) {
-			QueryPerformanceCounter(&block_start);
+		if (f == 299) {
+			isolate_frame_thread();
+			timed_load = machine_load_now();
+			QueryPerformanceCounter(&previous_end);
 			profiling = profile && !profile_present && !appear_frames;
 		}
 	}
@@ -2295,19 +2301,19 @@ int main(int argc, char **argv)
 		report_profile();
 	}
 
-	if (appear_frames && !appearances.empty())
+	if (appear_frames && !appearances.empty()) {
 		report_appearances();
-	else if (!blocks.empty()) {
-		std::vector<double> sorted = blocks;
+		print_other_processes_busy(timed_load);
+	} else if (!frame_ms.empty()) {
 		double sum = 0;
-
-		std::sort(sorted.begin(), sorted.end());
-		for (double block : blocks)
-			sum += block;
-		printf("%u draws a frame, %s: median %.3f ms, best %.3f ms, mean %.3f ms a frame over %zu blocks of 500\n",
-			mesh_count * passes, load_dll ? "with d3d11.dll" : "without", sorted[sorted.size() / 2], sorted[0], sum / blocks.size(), blocks.size());
-		printf("  of that recording and executing %.3f ms, presenting %.3f ms\n", record_ticks * 1000.0 / freq.QuadPart / timed_frames,
-			present_ticks * 1000.0 / freq.QuadPart / timed_frames);
+		for (double ms : frame_ms)
+			sum += ms;
+		auto median = [](std::vector<double> &v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+		double frame_median = median(frame_ms);
+		printf("%u draws a frame, %s: median %.3f ms, best tenth %.3f ms, mean %.3f ms a frame over %zu frames\n",
+			mesh_count * passes, load_dll ? "with d3d11.dll" : "without", frame_median, frame_ms[frame_ms.size() / 10], sum / frame_ms.size(), frame_ms.size());
+		printf("  of that recording and executing %.3f ms, presenting %.3f ms (medians)\n", median(record_ms), median(present_ms));
+		print_other_processes_busy(timed_load);
 	}
 	if (new_texture_count) {
 		double ms = new_texture_ticks * 1000.0 / freq.QuadPart;

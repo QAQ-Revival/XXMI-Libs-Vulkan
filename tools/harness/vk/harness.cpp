@@ -9,7 +9,7 @@
 //               [--upload late|unmapped|discard|fill|srcfill|lastfill]
 //               [--generated N [--overlay]] [--reload 1|2|3] [--profile]
 //               [--efmi file [--characters N] [--passes N] [--appear N]] [--lowmip [--wide]]
-//               [--frames N [--min-seconds N]]
+//               [--frames N [--min-seconds N]] [--cbring N]
 //
 // --instance gets the device's functions from vkGetInstanceProcAddr instead
 // of vkGetDeviceProcAddr, which are the loader's exports. --pool draws the
@@ -38,6 +38,7 @@
 #include <functional>
 #include <dbghelp.h>
 #include "../common/window.h"
+#include "../common/isolate.h"
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -186,6 +187,9 @@ int main(int argc, char **argv)
 	// --bonetick: the first bone of the pool is another every frame, the
 	// last of which is printed, for the picture to be checked against
 	bool bonetick = false;
+	// --cbring N: the constants move to another of N places every frame, as
+	// in the ring buffer of a game, and the place before is zeroed
+	int cbring = 0;
 	// --efmi <file>: the draws of characters as the game of the EFMI mods
 	// makes them, for the parts the file lists by the hash and the number
 	// of their indices, of --characters characters in --passes passes
@@ -221,6 +225,8 @@ int main(int argc, char **argv)
 			rewrite = true;
 		else if (!strcmp(argv[i], "--bonetick"))
 			bonetick = true;
+		else if (!strcmp(argv[i], "--cbring") && i + 1 < argc)
+			cbring = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--appear") && i + 1 < argc)
 			appear = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--efmi") && i + 1 < argc)
@@ -279,6 +285,10 @@ int main(int argc, char **argv)
 		}
 	}
 
+	if (cbring < 0 || cbring > 32) {
+		printf("--cbring takes 0 to 32 places\n");
+		return 1;
+	}
 	if ((frame_limit && appear) || (min_seconds && !frame_limit)) {
 		printf("--frames cannot be combined with --appear; --min-seconds requires --frames\n");
 		return 1;
@@ -1136,9 +1146,10 @@ int main(int argc, char **argv)
 	ULONGLONG start = GetTickCount64();
 	unsigned frames = 0;
 	LARGE_INTEGER frequency, before, after;
-	double recording = 0;
+	std::vector<double> recording_ms;
 	// The CPU time of the thread, which leaves out its waits for the GPU
-	ULONG64 cycles_before, cycles_after, cycles = 0;
+	ULONG64 cycles_before, cycles_after;
+	std::vector<ULONG64> cycles;
 	QueryPerformanceFrequency(&frequency);
 	HANDLE pacer_go = CreateEvent(NULL, FALSE, FALSE, NULL), pacer_done = CreateEvent(NULL, FALSE, FALSE, NULL);
 	std::function<void()> pacer_job;
@@ -1151,6 +1162,8 @@ int main(int argc, char **argv)
 			}
 		}).detach();
 	}
+	isolate_frame_thread();
+	MachineLoad timed_load = machine_load_now();
 	LARGE_INTEGER frame_start;
 	QueryPerformanceCounter(&frame_start);
 	for (bool last = false; !last;) {
@@ -1190,9 +1203,18 @@ int main(int argc, char **argv)
 		}
 		if (bonetick && pool_path)
 			((float*)((char*)pool_mapped + 16384))[0] = (float)(frames % 200 + 20) / 255.0f;
+		if (cbring) {
+			memset((char*)pool_mapped + 2048 + constants_offset, 0, sizeof(constants));
+			constants_offset = 4096 + (frames % cbring) * 256;
+			memcpy((char*)pool_mapped + 2048 + constants_offset, constants, sizeof(constants));
+		}
 		// Some of the bones are others every frame
 		for (size_t n = 0; efmi && n < 65536; n++)
 			((float*)efmi_mapped)[(1 << 18) + n] = (float)(frames + n);
+		if (frames == 30) {
+			isolate_frame_thread();
+			timed_load = machine_load_now();
+		}
 		QueryPerformanceCounter(&before);
 		QueryThreadCycleTime(GetCurrentThread(), &cycles_before);
 		profiling = profile && frames >= 120;
@@ -1282,8 +1304,8 @@ int main(int argc, char **argv)
 		QueryThreadCycleTime(GetCurrentThread(), &cycles_after);
 		// Not the first frames, which have everything made
 		if (frames >= 30) {
-			recording += (double)(after.QuadPart - before.QuadPart) * 1000 / frequency.QuadPart;
-			cycles += cycles_after - cycles_before;
+			recording_ms.push_back((double)(after.QuadPart - before.QuadPart) * 1000 / frequency.QuadPart);
+			cycles.push_back(cycles_after - cycles_before);
 		}
 
 		present.waitSemaphoreCount = 1;
@@ -1366,11 +1388,15 @@ int main(int argc, char **argv)
 		report_profile();
 	}
 	printf("frames: %u\n", frames);
+	if (frames > 30)
+		print_other_processes_busy(timed_load);
 	if (bonetick)
 		printf("last bone: %u\n", (frames - 1) % 200 + 20);
-	if (frames > 30) {
-		printf("recording and submitting: %.3f ms a frame\n", recording / (frames - 30));
-		printf("recording and submitting: %.3f million cycles of the thread a frame\n", cycles / 1e6 / (frames - 30));
+	if (!recording_ms.empty()) {
+		std::sort(recording_ms.begin(), recording_ms.end());
+		std::sort(cycles.begin(), cycles.end());
+		printf("recording and submitting: %.3f ms a frame (median)\n", recording_ms[recording_ms.size() / 2]);
+		printf("recording and submitting: %.3f million cycles of the thread a frame (median)\n", cycles[cycles.size() / 2] / 1e6);
 	}
 
 	// The middle is within the game's square and the triangle of the test

@@ -13,6 +13,7 @@
 #include "UploadHashReadback.h"
 
 Dx12Stats dx12_stats;
+volatile LONG64 dx12_game_draws;
 Dx12Memory dx12_memory;
 volatile UINT dx12_frame;
 volatile UINT dx12_raytracing_frame;
@@ -32,7 +33,12 @@ static bool has_avx2()
 	return (regs[1] & 0x20) != 0;
 }
 
-static const bool avx2_stream_loads = has_avx2();
+static const bool avx2_available = has_avx2();
+
+bool Dx12HasAvx2()
+{
+	return avx2_available;
+}
 
 static void copy_write_combined_sse41(BYTE *dst, const BYTE *src, size_t count)
 {
@@ -70,7 +76,7 @@ uint32_t Dx12Crc32cWriteCombined(uint32_t hash, const BYTE *src, size_t length)
 
 	while (length) {
 		count = length < sizeof(chunk) ? length : sizeof(chunk);
-		if (avx2_stream_loads)
+		if (avx2_available)
 			copy_write_combined_avx2(chunk, src, count);
 		else
 			copy_write_combined_sse41(chunk, src, count);
@@ -110,7 +116,7 @@ void Dx12FramePresented()
 	static unsigned frames, reports;
 	ULONGLONG now = GetTickCount64();
 	double seconds, per_frame;
-	LONG64 draws, dispatches, closed, executed, calls, blas, rays;
+	LONG64 draws, dispatches, closed, executed, calls, blas, rays, skips, reruns;
 
 	dx12_frame++;
 	Dx12FinishUploadHashes();
@@ -149,6 +155,14 @@ void Dx12FramePresented()
 		Dx12LogDebug("%u frames in %.1fs (%.1f fps), per frame: %.0f draws, %.0f dispatches, %.1f command lists closed, %.1f executed in %.1f calls\n",
 			frames, seconds, frames / seconds, draws * per_frame, dispatches * per_frame,
 			closed * per_frame, executed * per_frame, calls * per_frame);
+	}
+	skips = InterlockedExchange64(&dx12_stats.present_skips, 0);
+	reruns = InterlockedExchange64(&dx12_stats.present_reruns, 0);
+	if (skips || reruns) {
+		if (info)
+			Dx12LogInfo("Frame generation presents: %lld left [Present] out, %lld ran it again\n", skips, reruns);
+		else
+			Dx12LogDebug("Frame generation presents: %lld left [Present] out, %lld ran it again\n", skips, reruns);
 	}
 	if (blas || rays) {
 		Dx12LogInfo("Ray tracing: %.1f acceleration structure builds and %.1f DispatchRays per frame\n",

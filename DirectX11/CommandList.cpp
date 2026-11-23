@@ -3661,6 +3661,7 @@ void RunCustomShaderCommand::run(CommandListState *state)
 
 	mOrigContext1->RSSetViewports(num_viewports, saved_viewports);
 	restore_om_state(mOrigContext1, &om_state);
+	state->mHackerContext->ForgetDrawOutputViews();
 
 	if (saved_vs)
 		saved_vs->Release();
@@ -4018,34 +4019,23 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 		return override->second.filter_index != FLT_MAX ? override->second.filter_index : 1.0f;
 	}
 
-	ShaderMap::iterator shader_it = lookup_shader_hash(shader);
-
-	if (shader_it == G->mShaders.end())
-		return 0.0;
-
 	if (shader_target.evaluation_mode == ShaderTargetEvaluationMode::SHADER)
 	{
-		ShaderOverrideMap::iterator override = lookup_shaderoverride(shader_it->second);
-		if (override == G->mShaderOverrideMap.end())
+		ShaderOverride *shader_override;
+		if (!mHackerContext->BoundShaderInfo(shader, &shader_override, nullptr))
+			return 0.0;
+		if (!shader_override)
 			return 0.0;  // Positive zero means shader bound with no ShaderOverride.
 
-		if (override->second.filter_index != FLT_MAX)
-			return override->second.filter_index;
+		if (shader_override->filter_index != FLT_MAX)
+			return shader_override->filter_index;
 
 		return 1.0;  // Matched ShaderOverride / ShaderRegex, but no filter_index.
 	}
 
-	//LogDebug("ShaderTarget Member Evaluation hash=%016I64x\n", shader_it->second);
-
-	const ShaderBindings *bindings = nullptr;
-	{
-		// Shaders created on other threads insert into the cache. Its
-		// elements stay where they are, so the pointer outlives the lock:
-		CriticalSectionGuard(&G->mShaderBindingsLock);
-		auto it = G->mShaderBindingsCache.find(shader_it->second);
-		if (it != G->mShaderBindingsCache.end())
-			bindings = &it->second;
-	}
+	const ShaderBindings *bindings;
+	if (!mHackerContext->BoundShaderInfo(shader, nullptr, &bindings))
+		return 0.0;
 	if (!bindings) {
 		assert(false);
 		return 0.0;  // Safety check, should never happen;
@@ -6224,7 +6214,25 @@ DEFINE_OPERATOR(exponent_operator,      "**", (pow(lhs, rhs)));
 DEFINE_OPERATOR(multiplication_operator,"*",  (lhs * rhs));
 DEFINE_OPERATOR(division_operator,      "/",  (lhs / rhs));
 DEFINE_OPERATOR(floor_division_operator,"//", (floor(lhs / rhs)));
-DEFINE_OPERATOR(modulus_operator,       "%",  (fmod(lhs, rhs)));
+
+// fmodf is exact, and so is the integer remainder of two integers below 2^24,
+// which both floats hold exactly: the same result, with the sign of a zero
+// taken from lhs as fmodf does, at a fraction of the cost of the CRT's fmodf.
+// Ini expressions such as "DRAW_TYPE % 2" run for every draw.
+static inline float ini_fmod(float lhs, float rhs)
+{
+	if (fabsf(lhs) < 16777216.0f && fabsf(rhs) < 16777216.0f) {
+		int32_t l = (int32_t)lhs, r = (int32_t)rhs;
+
+		if (r && (float)l == lhs && (float)r == rhs) {
+			int32_t m = l % r;
+			return m ? (float)m : lhs * 0.0f;
+		}
+	}
+	return fmodf(lhs, rhs);
+}
+
+DEFINE_OPERATOR(modulus_operator,       "%",  (ini_fmod(lhs, rhs)));
 
 DEFINE_OPERATOR(addition_operator,      "+",  (lhs + rhs));
 DEFINE_OPERATOR(subtraction_operator,   "-",  (lhs - rhs));
@@ -10800,19 +10808,10 @@ static const ShaderBindings* ResolvePixelShaderBindings(CommandListState* state)
 	if (!shader)
 		return state->mHackerContext->Dx12CurrentShaderBindings(L'p');
 
-	// Find the shader's registered hash.
-	auto shader_it = lookup_shader_hash(shader);
-	if (shader_it == G->mShaders.end())
+	const ShaderBindings *bindings;
+	if (!state->mHackerContext->BoundShaderInfo(shader, nullptr, &bindings))
 		return nullptr;
-
-	// Shaders created on other threads insert into the cache. Its elements
-	// stay where they are, so the pointer outlives the lock:
-	CriticalSectionGuard(&G->mShaderBindingsLock);
-	auto bindings_it = G->mShaderBindingsCache.find(shader_it->second);
-	if (bindings_it == G->mShaderBindingsCache.end())
-		return nullptr;
-
-	return &bindings_it->second;
+	return bindings;
 }
 
 void InitialTexturesSnapshot::SnapshotInitialTextures(CommandListState* state)
@@ -12676,6 +12675,7 @@ void ResourceCopyTarget::SetResource(
 		render_view[slot] = (ID3D11RenderTargetView*)view;
 
 		mOrigContext1->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, render_view, depth_view);
+		state->mHackerContext->ForgetDrawOutputViews();
 
 		release_slots(render_view, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, slot);
 		if (depth_view)
@@ -12691,6 +12691,7 @@ void ResourceCopyTarget::SetResource(
 		depth_view = (ID3D11DepthStencilView*)view;
 
 		mOrigContext1->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, render_view, depth_view);
+		state->mHackerContext->ForgetDrawOutputViews();
 
 		// Only the depth view was replaced, and it is the caller's,
 		// so no slot of this array is kept:
@@ -12858,7 +12859,32 @@ static bool find_native_output_filter_overrides(ResourceCopyTarget &target, Comm
 {
 	const unsigned slot = target.ResolveSlot(state);
 	ID3D11View *output_view = nullptr;
-	if (slot != UINT_MAX) {
+	bool owned = true;
+	HackerContext *context = state->mHackerContext;
+	if (slot != UINT_MAX && context->InDrawCommandLists(state->call_info)) {
+		// Filters on the output views are typically evaluated by several
+		// sections for every draw call, which cannot rebind them unseen:
+		if (target.type == ResourceCopyTargetType::RENDER_TARGET) {
+			if (!context->mDrawOutputRtvsKnown) {
+				state->mOrigContext1->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,
+						context->mDrawOutputRtvs, nullptr);
+				for (ID3D11RenderTargetView *view : context->mDrawOutputRtvs)
+					if (view)
+						view->Release();
+				context->mDrawOutputRtvsKnown = true;
+			}
+			output_view = context->mDrawOutputRtvs[slot];
+		} else {
+			if (!context->mDrawOutputDsvKnown) {
+				state->mOrigContext1->OMGetRenderTargets(0, nullptr, &context->mDrawOutputDsv);
+				if (context->mDrawOutputDsv)
+					context->mDrawOutputDsv->Release();
+				context->mDrawOutputDsvKnown = true;
+			}
+			output_view = context->mDrawOutputDsv;
+		}
+		owned = false;
+	} else if (slot != UINT_MAX) {
 		if (target.type == ResourceCopyTargetType::RENDER_TARGET) {
 			ID3D11RenderTargetView *targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
 			state->mOrigContext1->OMGetRenderTargets(slot + 1, targets, nullptr);
@@ -12883,7 +12909,8 @@ static bool find_native_output_filter_overrides(ResourceCopyTarget &target, Comm
 				resource->Release();
 			}
 		}
-		output_view->Release();
+		if (owned)
+			output_view->Release();
 	}
 	return bound;
 }
@@ -14600,7 +14627,8 @@ static ID3D11View* _CreateCompatibleView(
 		UINT offset,
 		DXGI_FORMAT format,
 		UINT buf_src_size,
-		ResourceCopyOptions options)
+		ResourceCopyOptions options,
+		HRESULT *create_hr = NULL)
 {
 	D3D11_RESOURCE_DIMENSION dimension;
 	ID3D11Buffer *buf;
@@ -14661,6 +14689,8 @@ static ID3D11View* _CreateCompatibleView(
 	}
 
 	hr = (state->mOrigDevice1->*CreateView)(resource, pDesc, &view);
+	if (create_hr)
+		*create_hr = hr;
 	if (FAILED(hr)) {
 		LogInfo("Resource copy CreateCompatibleView failed: %x\n", hr);
 		if (pDesc)
@@ -14683,32 +14713,33 @@ static ID3D11View* CreateCompatibleView(
 		UINT offset,
 		DXGI_FORMAT format,
 		UINT buf_src_size,
-		ResourceCopyOptions options)
+		ResourceCopyOptions options,
+		HRESULT *create_hr = NULL)
 {
 	switch (dst->type) {
 		case ResourceCopyTargetType::SHADER_RESOURCE:
 			return _CreateCompatibleView<ID3D11ShaderResourceView,
 			       D3D11_SHADER_RESOURCE_VIEW_DESC,
 			       &ID3D11Device::CreateShaderResourceView>
-				       (resource, state, stride, offset, format, buf_src_size, options);
+				       (resource, state, stride, offset, format, buf_src_size, options, create_hr);
 		case ResourceCopyTargetType::RENDER_TARGET:
 			return _CreateCompatibleView<ID3D11RenderTargetView,
 			       D3D11_RENDER_TARGET_VIEW_DESC,
 			       &ID3D11Device::CreateRenderTargetView>
-				       (resource, state, stride, offset, format, buf_src_size, options);
+				       (resource, state, stride, offset, format, buf_src_size, options, create_hr);
 		case ResourceCopyTargetType::DEPTH_STENCIL_TARGET:
 			return _CreateCompatibleView<ID3D11DepthStencilView,
 			       D3D11_DEPTH_STENCIL_VIEW_DESC,
 			       &ID3D11Device::CreateDepthStencilView>
-				       (resource, state, stride, offset, format, buf_src_size, options);
+				       (resource, state, stride, offset, format, buf_src_size, options, create_hr);
 		case ResourceCopyTargetType::UNORDERED_ACCESS_VIEW:
 			return _CreateCompatibleView<ID3D11UnorderedAccessView,
 			       D3D11_UNORDERED_ACCESS_VIEW_DESC,
 			       &ID3D11Device::CreateUnorderedAccessView>
-				       (resource, state, stride, offset, format, buf_src_size, options);
+				       (resource, state, stride, offset, format, buf_src_size, options, create_hr);
 		case ResourceCopyTargetType::THIS_RESOURCE:
 			if (state->this_target)
-				return CreateCompatibleView(state->this_target, resource, state, stride, offset, format, buf_src_size, options);
+				return CreateCompatibleView(state->this_target, resource, state, stride, offset, format, buf_src_size, options, create_hr);
 			break;
 	}
 	return NULL;
@@ -15081,6 +15112,34 @@ ResourceCopyOperation::~ResourceCopyOperation()
 
 	if (cached_view)
 		cached_view->Release();
+
+	if (failed_view.resource)
+		failed_view.resource->Release();
+}
+
+// The kind of view CreateCompatibleView makes for the destination
+ResourceCopyTargetType ResourceCopyOperation::ViewTargetType(CommandListState *state) const
+{
+	if (dst.type == ResourceCopyTargetType::THIS_RESOURCE)
+		return state->this_target ? state->this_target->type : ResourceCopyTargetType::INVALID;
+	return dst.type;
+}
+
+bool ResourceCopyOperation::RepeatsFailedView(CommandListState *state, ID3D11Resource *resource, UINT stride, UINT offset, DXGI_FORMAT format, UINT size) const
+{
+	return resource && failed_view.resource == resource
+		&& failed_view.type == ViewTargetType(state)
+		&& failed_view.stride == stride && failed_view.offset == offset
+		&& failed_view.format == format && failed_view.size == size
+		&& failed_view.options == options;
+}
+
+void ResourceCopyOperation::NoteFailedView(CommandListState *state, ID3D11Resource *resource, UINT stride, UINT offset, DXGI_FORMAT format, UINT size)
+{
+	resource->AddRef();
+	if (failed_view.resource)
+		failed_view.resource->Release();
+	failed_view = { resource, ViewTargetType(state), stride, offset, size, format, options };
 }
 
 static bool ViewMatchesResource(ID3D11View *view, ID3D11Resource *resource)
@@ -15367,9 +15426,13 @@ void ResourceCopyOperation::CopyResourceToResource(
 					stride, offset, format, buf_src_size, options);
 		}
 
-		if (!dst_view) {
+		if (!dst_view && !RepeatsFailedView(state, dst_resource, stride, offset, format, buf_src_size)) {
+			HRESULT hr = S_OK;
+
 			dst_view = CreateCompatibleView(&dst, dst_resource, state,
-					stride, offset, format, buf_src_size, options);
+					stride, offset, format, buf_src_size, options, &hr);
+			if (hr == E_INVALIDARG)
+				NoteFailedView(state, dst_resource, stride, offset, format, buf_src_size);
 
 			if (recall_view && dst_view) {
 				state->mHackerContext->NoteShaderResourceView(dst_view, dst_resource,
