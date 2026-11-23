@@ -31,6 +31,7 @@ class ResourceCopyTarget;
 class FileContents;
 struct FileIdentity;
 class ResourceFilterTarget;
+struct CheckTextureOverrideBatchBindings;
 
 struct InputLayoutElementOverride {
 	struct Match {
@@ -94,6 +95,7 @@ public:
 
 	// Anything that needs to be updated at the end of the command list:
 	bool update_params;
+	CheckTextureOverrideBatchBindings *active_check_texture_bindings = nullptr;
 
 	CommandListState();
 	~CommandListState();
