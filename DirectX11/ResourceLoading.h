@@ -108,7 +108,8 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 // Before the file is read: a resource made from this very file, unchanged
 // since, with the same key except for the content, which is left unset.
 // AddRef()ed for the caller.
-ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std::wstring &path, const FileIdentity &identity);
+ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std::wstring &path,
+		const FileIdentity &identity, bool &from_previous_config);
 void RetainSharedFileResources(const std::unordered_set<std::wstring> &lower_paths);
 // A provisional entry is for a resource that may not be used yet (made on
 // the loader thread of ModLoading.h): only threads inside a

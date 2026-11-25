@@ -556,11 +556,12 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 }
 
 ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std::wstring &path,
-		const FileIdentity &identity)
+		const FileIdentity &identity, bool &from_previous_config)
 {
 	std::vector<ID3D11Resource*> released;
 	std::wstring lower = LowerPath(path);
 	ID3D11Resource *match = nullptr;
+	from_previous_config = false;
 
 	{
 		std::lock_guard<std::mutex> lock(shared_resources_lock);
@@ -581,6 +582,7 @@ ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std
 					if (!match && SameCreation(entry->key, key)) {
 						match = entry->resource;
 						match->AddRef();
+						from_previous_config = entry->generation != shared_generation;
 						entry->generation = shared_generation;
 					}
 					file++;

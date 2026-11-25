@@ -34,7 +34,10 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'Version resource generation failed' }
         $taskHeader = Join-Path $taskSource 'version.generated.h'
         if (!(Test-Path -LiteralPath $taskHeader) -or [IO.File]::ReadAllText($taskGenerated) -ne [IO.File]::ReadAllText($taskHeader)) { Copy-Item -LiteralPath $taskGenerated -Destination $taskHeader }
-        & (Join-Path $taskVisualStudio 'MSBuild/Current/Bin/MSBuild.exe') ./StereovisionHacks.sln /t:DirectX11 '/p:Configuration=Zip Release' /p:Platform=x64 "/p:WindowsTargetPlatformVersion=$taskSdk" /m:4 /v:minimal /nologo
+        $taskMsbuild = Join-Path $taskVisualStudio 'MSBuild/Current/Bin/MSBuild.exe'
+        $taskToolset = @()
+        if ((Get-Item -LiteralPath $taskMsbuild).VersionInfo.FileMajorPart -eq 17) { $taskToolset = @('/p:PlatformToolset=v143') }
+        & $taskMsbuild ./StereovisionHacks.sln /t:DirectX11 '/p:Configuration=Zip Release' /p:Platform=x64 "/p:WindowsTargetPlatformVersion=$taskSdk" @taskToolset /m:4 /v:minimal /nologo
         if ($LASTEXITCODE -ne 0) { throw 'Native build failed' }
     } finally { Pop-Location }
     Copy-Item -LiteralPath (Join-Path $taskSource 'x64/Zip Release/d3d11.dll') -Destination (Join-Path $taskWork 'd3d11.dll')

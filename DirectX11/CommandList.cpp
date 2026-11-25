@@ -8376,11 +8376,17 @@ void CustomResource::LoadBufferFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG 
 		share_key.misc_flags = desc.MiscFlags;
 		share_key.byte_width = desc.ByteWidth;
 		share_key.structure_stride = desc.StructureByteStride;
-		load->resource = FindRetainedFileResource(share_key, filename, file.identity);
+		bool retained;
+		load->resource = FindRetainedFileResource(share_key, filename, file.identity, retained);
 		if (load->resource) {
-			LogInfo("Sharing the buffer already loaded from %S [%S]\n", filename.c_str(), name.c_str());
+			if (retained) {
+				LogInfoW(L"Kept the buffer loaded from unchanged %s before the reload\n", filename.c_str());
+				InterlockedIncrement((volatile LONG*)&Profiling::resources_retained);
+			} else {
+				LogInfo("Sharing the buffer already loaded from %S [%S]\n", filename.c_str(), name.c_str());
+				InterlockedIncrement((volatile LONG*)&Profiling::resources_shared);
+			}
 			RecordResourceFileUse(filename);
-			InterlockedIncrement((volatile LONG*)&Profiling::resources_shared);
 			load->reused = true;
 			load->device = mOrigDevice1;
 			load->buffer = true;
@@ -8530,11 +8536,17 @@ void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_f
 		// Auto-detected WIC colour space needs the image before looking it up.
 		if (dds || WICFlagsWithoutData(&wic_flags)) {
 			share_key.load_flags = dds ? static_cast<UINT>(dds_flags) : static_cast<UINT>(wic_flags);
-			load->resource = FindRetainedFileResource(share_key, filename, file.identity);
+			bool retained;
+			load->resource = FindRetainedFileResource(share_key, filename, file.identity, retained);
 			if (load->resource) {
-				LogInfoW(L"Sharing the texture already loaded from %s\n", filename.c_str());
+				if (retained) {
+					LogInfoW(L"Kept the texture loaded from unchanged %s before the reload\n", filename.c_str());
+					InterlockedIncrement((volatile LONG*)&Profiling::resources_retained);
+				} else {
+					LogInfoW(L"Sharing the texture already loaded from %s\n", filename.c_str());
+					InterlockedIncrement((volatile LONG*)&Profiling::resources_shared);
+				}
 				RecordResourceFileUse(filename);
-				InterlockedIncrement((volatile LONG*)&Profiling::resources_shared);
 				load->reused = true;
 				load->device = mOrigDevice1;
 				return;
