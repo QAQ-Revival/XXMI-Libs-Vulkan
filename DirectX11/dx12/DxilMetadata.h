@@ -1,13 +1,9 @@
 #pragma once
 
+#include <span>
 #include <vector>
 
 #include "Dx12Common.h"
-
-// The one thing about a DXIL shader that is only in its LLVM bitcode and that
-// we need: how large its constant buffers are. D3D12 binds a constant buffer
-// by address, so what the shader declares is all there is to tell how much of
-// the memory at that address belongs to the buffer.
 
 struct Dx12DxilCBuffer {
 	UINT space;
@@ -17,6 +13,15 @@ struct Dx12DxilCBuffer {
 	UINT bytes;
 };
 
-// data is the DXIL part of a shader container. False if it could not be read,
-// which leaves buffers as it was.
-bool Dx12ReadDxilCBuffers(const BYTE *data, size_t size, std::vector<Dx12DxilCBuffer> *buffers);
+struct Dx12DxilStructuredBuffer {
+	UINT space, reg, count, stride;
+	bool uav;
+};
+
+struct Dx12DxilResources {
+	std::vector<Dx12DxilCBuffer> cbuffers;
+	std::vector<Dx12DxilStructuredBuffer> structured;
+};
+
+// Reads sizes and strides from the DXIL part of the container. PSV0 omits them.
+bool Dx12ReadDxilResources(std::span<const BYTE> data, Dx12DxilResources *result);

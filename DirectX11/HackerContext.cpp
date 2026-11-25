@@ -28,8 +28,11 @@
 #include "GpuWatch.h"
 #include "dx12/Bridge.h"
 #include "dx12/ShimDevice.h"
+#include "BindingProxy.h"
+#include "ModLoading.h"
 
 #include <wrl/implements.h>
+#include <d3d11_4.h>
 
 // -----------------------------------------------------------------------------------------------
 
@@ -75,6 +78,8 @@ HackerContext::HackerContext(ID3D11Device1 *pDevice1, ID3D11DeviceContext1 *pCon
 	mOrigContext1 = pContext1;
 	mRealOrigContext1 = pContext1;
 	mHackerDevice = NULL;
+	if (pDevice1 && pDevice1->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_1)
+		mVertexInputSlots = 16;
 
 	ResetTrackedPipelineState();
 	mDeferredShaderGeneration = G->deferred_shader_generation;
@@ -104,11 +109,38 @@ HackerContext::~HackerContext()
 
 	for (void *spare : mDivertSpares)
 		free(spare);
+
+	FreeBindingProxy(mBindingProxy);
+}
+
+void HackerContext::ForgetGameBindings(ResourceCopyTargetType type, wchar_t shader_type, unsigned first, unsigned count)
+{
+	uint32_t *known;
+	switch (type) {
+		case ResourceCopyTargetType::VERTEX_BUFFER:
+			known = &mGameVertexBuffersKnown;
+			break;
+		case ResourceCopyTargetType::SHADER_RESOURCE: {
+			static const wchar_t stages[] = L"vhdgpc";
+			const wchar_t *stage = shader_type ? wcschr(stages, shader_type) : NULL;
+			if (!stage) {
+				ForgetGameBindings();
+				return;
+			}
+			known = &mGameSrvsKnown[stage - stages];
+			break;
+		}
+		default:
+			return;
+	}
+	for (unsigned i = first; i < GAME_BINDING_SLOTS && i - first < count; i++)
+		*known &= ~(1u << i);
 }
 
 void HackerContext::ResetTrackedPipelineState()
 {
 	ForgetDrawOutputViews();
+	ForgetGameBindings();
 	memset(mCurrentVertexBuffers, 0, sizeof(mCurrentVertexBuffers));
 	mCurrentIndexBuffer = 0;
 	memset(mCurrentVertexBuffersBindings, 0, sizeof(mCurrentVertexBuffersBindings));
@@ -586,7 +618,7 @@ template <class ID3D11Shader,
 	void (__stdcall ID3D11DeviceContext::*GetShaderVS2013BUGWORKAROUND)(ID3D11Shader**, ID3D11ClassInstance**, UINT*),
 	void (__stdcall ID3D11DeviceContext::*SetShaderVS2013BUGWORKAROUND)(ID3D11Shader*, ID3D11ClassInstance*const*, UINT)
 >
-bool HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 hash, wchar_t *shader_type)
+bool HackerContext::DeferredShaderReplacement(ID3D11DeviceChild *shader, UINT64 hash, const wchar_t *shader_type)
 {
 	ID3D11Shader *bound_shader = NULL, *replacement = NULL;
 	ID3D11ClassInstance *class_instances[256];
@@ -1019,6 +1051,7 @@ HRESULT HackerContext::ComputeDHash(ID3D11Texture2D* texture, UINT mipLevel, DXG
 		}
 	}
 
+	ForgetGameBindings();
 	return mDHasher.ComputeHash(GetPassThroughOrigContext1(), texture, mipLevel, srvFormat, outHash);
 }
 
@@ -1027,6 +1060,7 @@ void HackerContext::BeforeDraw(DrawContext &data)
 	Profiling::Spike::Scope spike(Profiling::Spike::DRAW_PRE);
 
 	draw_number++;
+	data.call_info.load_epoch = ModLoadEpoch();
 
 	mCheckTextureOverrideResultCount = 0;
 	mCheckTextureOverrideResultsDraw = &data.call_info;
@@ -1349,6 +1383,48 @@ STDMETHODIMP_(ULONG) HackerContext::Release(THIS)
 // the ID3D11DeviceContext.  That's right, it calls to get the exact
 // same object that it is using to call.  I swear.
 
+std::atomic<bool> game_has_unwrapped_context;
+
+void NoteUnwrappedContext(const char *how)
+{
+	if (!game_has_unwrapped_context.exchange(true))
+		LogInfo("The game has %s of Direct3D's own: checktextureoverride asks Direct3D for every binding\n", how);
+}
+
+bool IsBindingProxyInterface(REFIID riid, bool of_context)
+{
+	if (of_context)
+		return riid == __uuidof(ID3D11DeviceContext2) || riid == __uuidof(ID3D11DeviceContext3)
+			|| riid == __uuidof(ID3D11DeviceContext4);
+	return riid == __uuidof(ID3D11Device2) || riid == __uuidof(ID3D11Device3)
+		|| riid == __uuidof(ID3D11Device4) || riid == __uuidof(ID3D11Device5);
+}
+
+void NoteGameSrvsOf(HackerContext *context, int stage, UINT first, UINT count, ID3D11ShaderResourceView *const *views)
+{
+	context->ForgetCommandListSrvs(stage, first, count);
+	context->NoteGameSrvs(stage, first, count, views);
+}
+
+void NoteGameVertexBuffersOf(HackerContext *context, UINT first, UINT count, ID3D11Buffer *const *buffers, const UINT *strides, const UINT *offsets)
+{
+	context->NoteGameVertexBuffers(first, count, buffers, strides, offsets);
+}
+
+void ForgetGameBindingsOf(HackerContext *context)
+{
+	context->ForgetGameBindings();
+}
+IUnknown* HackerContext::GetBindingProxy()
+{
+	if (!mBindingProxy) {
+		IUnknown *proxy = MakeContextBindingProxy(mRealOrigContext1, this);
+		if (proxy && InterlockedCompareExchangePointer((void**)&mBindingProxy, proxy, NULL))
+			FreeBindingProxy(proxy);
+	}
+	return mBindingProxy;
+}
+
 HRESULT STDMETHODCALLTYPE HackerContext::QueryInterface(
 	/* [in] */ REFIID riid,
 	/* [iid_is][out] */ _COM_Outptr_ void __RPC_FAR *__RPC_FAR *ppvObject)
@@ -1369,6 +1445,18 @@ HRESULT STDMETHODCALLTYPE HackerContext::QueryInterface(
 	{
 		LogDebug("  failed result = %x for %p\n", hr, ppvObject);
 		return hr;
+	}
+	// With hooks on this context every bind reaches this object in any case:
+	const EnableHooks hooks = mOrigContext1->GetType() == D3D11_DEVICE_CONTEXT_DEFERRED
+		? EnableHooks::DEFERRED_CONTEXTS : EnableHooks::IMMEDIATE_CONTEXT;
+	if (IsBindingProxyInterface(riid, true) && !(G->enable_hooks & hooks)) {
+		// The reference the call took is the stand-in's:
+		if (IUnknown *proxy = GetBindingProxy()) {
+			*ppvObject = proxy;
+			LogDebug("  return binding stand-in %p of %p\n", proxy, mOrigContext1);
+			return hr;
+		}
+		NoteUnwrappedContext(NameFromIID(riid).c_str());
 	}
 
 	// To avoid letting the game bypass our hooked object, we need to return the 
@@ -1734,6 +1822,7 @@ void HackerContext::TrackAndDivertUnmap(ID3D11Resource *pResource, UINT Subresou
 {
 	size_t i;
 	MappedResourceInfo *map_info = NULL;
+	bool deallocate_diverted_memory = true;
 	Profiling::State profiling_state;
 	Profiling::Spike::Scope spike(Profiling::Spike::MAP);
 
@@ -1744,8 +1833,6 @@ void HackerContext::TrackAndDivertUnmap(ID3D11Resource *pResource, UINT Subresou
 	if (i == mMappedResources.size())
 		goto out_profile;
 	map_info = &mMappedResourceInfos[i];
-
-	bool deallocate_diverted_memory = true;
 
 	if ((map_info->bind_flags & (D3D11_BIND_FLAG)G->cache_resource_data) != 0)
 		UpdateResourceDataCacheFromMap(pResource, map_info->map.pData, map_info->size, &deallocate_diverted_memory,
@@ -1852,6 +1939,7 @@ STDMETHODIMP_(void) HackerContext::IASetVertexBuffers(THIS_
 	__in_ecount(NumBuffers)  const UINT *pOffsets)
 {
 	 mOrigContext1->IASetVertexBuffers(StartSlot, NumBuffers, ppVertexBuffers, pStrides, pOffsets);
+	 NoteGameVertexBuffers(StartSlot, NumBuffers, ppVertexBuffers, pStrides, pOffsets);
 
 	 // Register hashes of vertex buffers for browsing in Shader Hunting Mode.
 	 if (G->hunting == HUNTING_MODE_ENABLED) {
@@ -1986,7 +2074,7 @@ STDMETHODIMP_(void) HackerContext::GSSetShaderResources(THIS_
 	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
 	ForgetCommandListSrvs(3, StartSlot, NumViews);
-	SetShaderResources<&ID3D11DeviceContext::GSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
+	SetShaderResources<&ID3D11DeviceContext::GSSetShaderResources>(3, StartSlot, NumViews, ppShaderResourceViews);
 }
 
 STDMETHODIMP_(void) HackerContext::GSSetSamplers(THIS_
@@ -2059,6 +2147,7 @@ bool HackerContext::BeforeDispatch(DispatchContext *context)
 	if (!G->mShaderOverrideMap.empty()) {
 		ShaderOverride *shader_override;
 
+		context->call_info.load_epoch = ModLoadEpoch();
 		shader_override = LookupShaderOverride(mCurrentComputeShader);
 		if (shader_override) {
 			context->post_commands = &shader_override->post_command_list;
@@ -2515,6 +2604,7 @@ STDMETHODIMP_(void) HackerContext::ExecuteCommandList(THIS_
 
 	mOrigContext1->ExecuteCommandList(pCommandList, RestoreContextState);
 	ForgetDrawOutputViews();
+	ForgetGameBindings();
 	if (GpuWatch::enabled)
 		GpuWatch::mark_command_list(mOrigContext1);
 
@@ -2536,7 +2626,7 @@ STDMETHODIMP_(void) HackerContext::HSSetShaderResources(THIS_
 	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
 	ForgetCommandListSrvs(1, StartSlot, NumViews);
-	SetShaderResources<&ID3D11DeviceContext::HSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
+	SetShaderResources<&ID3D11DeviceContext::HSSetShaderResources>(1, StartSlot, NumViews, ppShaderResourceViews);
 }
 
 STDMETHODIMP_(void) HackerContext::HSSetShader(THIS_
@@ -2586,7 +2676,7 @@ STDMETHODIMP_(void) HackerContext::DSSetShaderResources(THIS_
 	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
 	ForgetCommandListSrvs(2, StartSlot, NumViews);
-	SetShaderResources<&ID3D11DeviceContext::DSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
+	SetShaderResources<&ID3D11DeviceContext::DSSetShaderResources>(2, StartSlot, NumViews, ppShaderResourceViews);
 }
 
 STDMETHODIMP_(void) HackerContext::DSSetShader(THIS_
@@ -2636,7 +2726,7 @@ STDMETHODIMP_(void) HackerContext::CSSetShaderResources(THIS_
 	__in_ecount(NumViews)  ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
 	ForgetCommandListSrvs(5, StartSlot, NumViews);
-	SetShaderResources<&ID3D11DeviceContext::CSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
+	SetShaderResources<&ID3D11DeviceContext::CSSetShaderResources>(5, StartSlot, NumViews, ppShaderResourceViews);
 }
 
 STDMETHODIMP_(void) HackerContext::CSSetUnorderedAccessViews(THIS_
@@ -3288,6 +3378,7 @@ void HackerContext::BindResources()
 
 void HackerContext::Bind3DMigotoResources()
 {
+	ForgetGameBindings();
 	// Third generation of binding the stereo resources. We used to do this
 	// in the SetShader calls, but that was problematic in certain games
 	// like Akiba's Trip that would unbind all resources between then and
@@ -3388,7 +3479,7 @@ template <void (__stdcall ID3D11DeviceContext::*OrigSetShaderResources)(THIS_
 		UINT StartSlot,
 		UINT NumViews,
 		ID3D11ShaderResourceView *const *ppShaderResourceViews)>
-void HackerContext::SetShaderResources(UINT StartSlot, UINT NumViews,
+void HackerContext::SetShaderResources(int stage, UINT StartSlot, UINT NumViews,
 		ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
 	ID3D11ShaderResourceView **override_srvs = NULL;
@@ -3409,9 +3500,11 @@ void HackerContext::SetShaderResources(UINT StartSlot, UINT NumViews,
 
 	if (override_srvs) {
 		(mOrigContext1->*OrigSetShaderResources)(StartSlot, NumViews, override_srvs);
+		NoteGameSrvs(stage, StartSlot, NumViews, override_srvs);
 		delete [] override_srvs;
 	} else {
 		(mOrigContext1->*OrigSetShaderResources)(StartSlot, NumViews, ppShaderResourceViews);
+		NoteGameSrvs(stage, StartSlot, NumViews, ppShaderResourceViews);
 	}
 }
 
@@ -3443,7 +3536,7 @@ STDMETHODIMP_(void) HackerContext::PSSetShaderResources(THIS_
 	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
 	ForgetCommandListSrvs(4, StartSlot, NumViews);
-	SetShaderResources<&ID3D11DeviceContext::PSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
+	SetShaderResources<&ID3D11DeviceContext::PSSetShaderResources>(4, StartSlot, NumViews, ppShaderResourceViews);
 }
 
 STDMETHODIMP_(void) HackerContext::PSSetShader(THIS_
@@ -3582,7 +3675,7 @@ STDMETHODIMP_(void) HackerContext::VSSetShaderResources(THIS_
 	__in_ecount(NumViews) ID3D11ShaderResourceView *const *ppShaderResourceViews)
 {
 	ForgetCommandListSrvs(0, StartSlot, NumViews);
-	SetShaderResources<&ID3D11DeviceContext::VSSetShaderResources>(StartSlot, NumViews, ppShaderResourceViews);
+	SetShaderResources<&ID3D11DeviceContext::VSSetShaderResources>(0, StartSlot, NumViews, ppShaderResourceViews);
 }
 
 STDMETHODIMP_(void) HackerContext::OMSetRenderTargets(THIS_

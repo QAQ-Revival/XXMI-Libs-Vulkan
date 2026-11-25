@@ -4,6 +4,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <bit>
 #include <deque>
 #include <map>
 #include <set>
@@ -34,7 +35,7 @@
 #include "../vk/VkScope.h"
 
 volatile bool dx12_draw_path_active;
-volatile UINT dx12_draw_generation = 1;
+std::atomic<UINT> dx12_draw_generation{1};
 bool dx12_mods_disabled;
 static bool mods_faulted;
 
@@ -1276,7 +1277,8 @@ static bool unhashed_buffer_is_boring(const Dx12ListBufferWrites *writes, UINT64
 	LONG64 word;
 	bool own;
 
-	if (*boring_unhashed_slot(kind, bytes, &word) != word)
+	const auto slot = boring_unhashed_slot(kind, bytes, &word);
+	if (*slot != word)
 		return false;
 	return Dx12FindBuffer(va, &resource, &offset) && !Dx12FindListBufferHash(writes, resource, offset, &hash, &own);
 }
@@ -1337,7 +1339,8 @@ static Published* publish_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 	asked.ib_va = 0;
 	asked.ib_bytes = 0;
 	asked.ib_format = 0;
-	slot = buffer_cache_way(buffer_cache_slot(&asked, va, bytes, kind, stride, indices, &tag), &asked, tag, false);
+	auto bucket = buffer_cache_slot(&asked, va, bytes, kind, stride, indices, &tag);
+	slot = buffer_cache_way(bucket, &asked, tag, false);
 	cached = slot ? &slot->data : NULL;
 
 	// In this order: the pointers are only good with the generation
@@ -1476,8 +1479,10 @@ static Published* look_up_buffer(UINT64 va, UINT64 bytes, UINT kind, UINT stride
 				remember_buffer(&asked, has_hash, &data, &lookup);
 				if (asked.generation) {
 					asked.boring = TextureOverrideCandidatesEmpty(entry->resource);
-					if (asked.boring && !has_hash)
-						InterlockedExchange64(boring_unhashed_slot(kind, bytes, &word), word);
+					if (asked.boring && !has_hash) {
+						auto unhashed_slot = boring_unhashed_slot(kind, bytes, &word);
+						InterlockedExchange64(unhashed_slot, word);
+					}
 				} else
 					stats.lookups_unstamped++;
 				// What could not be remembered still replaces
@@ -1695,8 +1700,10 @@ static PublishedConstants* publish_constants(Dx12ShaderStage stage, UINT slot, U
 		set_resource_hash(entry->buffer, D3D11_RESOURCE_DIMENSION_BUFFER, hash, 0, NULL);
 		entry->boring = TextureOverrideCandidatesEmpty(entry->buffer);
 	}
-	if (entry->boring)
-		InterlockedExchange64(boring_constants_slot(stage, slot, bytes, &word), word);
+	if (entry->boring) {
+		auto cached = boring_constants_slot(stage, slot, bytes, &word);
+		InterlockedExchange64(cached, word);
+	}
 	return entry;
 }
 
@@ -2262,7 +2269,6 @@ static void game_wrote_buffers(Dx12GraphicsCommandList *list, UINT64 written_sco
 	UINT64 mask = shader && shader->reflected && !shader->unmasked ? shader->uav : ~0ull, offset;
 	Dx12DescriptorSlot view;
 	ID3D12Resource *resource;
-	unsigned long slot;
 
 	if (!signature) {
 		for (auto &entry : published) {
@@ -2271,7 +2277,8 @@ static void game_wrote_buffers(Dx12GraphicsCommandList *list, UINT64 written_sco
 		}
 		return;
 	}
-	for (; _BitScanForward64(&slot, mask); mask &= mask - 1) {
+	for (; mask; mask &= mask - 1) {
+		UINT slot = std::countr_zero(mask);
 		if (!Dx12ResolveRegister(&list->mState, signature, DX12_STAGE_CS, D3D12_DESCRIPTOR_RANGE_TYPE_UAV, slot, &view))
 			continue;
 		resource = view.resource;
@@ -2973,10 +2980,13 @@ static bool locate(Dx12ShaderStage stage, D3D12_DESCRIPTOR_RANGE_TYPE type, UINT
 
 static void apply_shader_resource(Dx12ShaderStage stage, UINT slot, ID3D11ShaderResourceView *srv)
 {
+	const Dx12ShaderInfo *shader = scope->shaders[stage];
 	ShimView *view = ShimViewOf(srv);
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
 	Dx12RegisterLocation location;
 
+	if (shader && shader->srv_dimension[slot] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+		return;
 	// The game's own, put back by a mod that saved it
 	if (view->resource->foreign || !view->handle.ptr)
 		return;
@@ -3075,11 +3085,46 @@ bool Dx12ScopeCanBindSampler(wchar_t shader_type, UINT slot)
 	return patched && (patched->samplers & 1u << slot);
 }
 
+static bool write_game_acceleration_structures(Dx12ShaderStage stage, const ShimShader *shader)
+{
+	const auto dimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+	const Dx12RootArguments &arguments = scope->list->mState.graphics;
+
+	for (UINT slot = 0; slot < SHIM_SRV_SLOTS; slot++) {
+		if (shader->srv_dimension[slot] != dimension)
+			continue;
+		if (scope->extension.signature && (scope->extension.extra.srv[stage][slot / 64] & 1ull << (slot % 64)))
+			continue;
+
+		Dx12RegisterLocation location;
+		if (!scope->signature || !Dx12LocateRegister(scope->signature, stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location))
+			return false;
+		if (scope->signature->parameters[location.parameter].visibility == D3D12_SHADER_VISIBILITY_ALL) {
+			for (Dx12ShaderStage other : graphics_stages) {
+				const Dx12ShaderInfo *reader = scope->shaders[other];
+				if (other == stage || !reader || ((scope->custom_stages & 1u << other) && reader->srv_dimension[slot] == dimension))
+					continue;
+				if (!reader->reflected || reader->unmasked || reader->unbounded_srv || (reader->srv[slot / 64] & 1ull << (slot % 64)))
+					return false;
+			}
+		}
+		if (!location.table) {
+			root_descriptor(&location, D3D12_ROOT_PARAMETER_TYPE_SRV, 0);
+			continue;
+		}
+		D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
+		if (!(arguments.set & (1ull << location.parameter)) || !table_descriptor(&location, &descriptor)
+		    || !Dx12ShimNullSrv((BYTE)dimension, 0, descriptor))
+			return false;
+	}
+	return true;
+}
+
 // A shader of the mod's reads zeros where the mod set none, as under D3D11,
 // and not the game's texture the table has there. Only for those and the
 // registers patches added: the game's shaders keep their own textures where a
 // mod sets none.
-static void apply_unbound_shader_resources(const ShimState *mod)
+static bool apply_unbound_shader_resources(const ShimState *mod)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE descriptor;
 	Dx12RegisterLocation location;
@@ -3091,14 +3136,22 @@ static void apply_unbound_shader_resources(const ShimState *mod)
 		if (!(scope->custom_stages & 1u << stage))
 			continue;
 		shader = mod_shader_form(mod, stage);
+		if (shader->uses_acceleration_structure && !write_game_acceleration_structures(stage, shader)) {
+			static bool reported;
+			log_once(&reported, "Could not bind null acceleration structures for a mod shader on the game's root signature. The draw uses the game's shaders.");
+			return false;
+		}
 
 		for (word = 0; word < ARRAYSIZE(mod->stages[stage].srv_unbound); word++) {
 			mask = mod->stages[stage].srv_unbound[word] & (UINT)(shader->srv_used[word / 2] >> (word % 2 * 32));
 			for (; _BitScanForward(&bit, mask); mask &= mask - 1) {
 				slot = word * 32 + bit;
+				if (shader->srv_dimension[slot] == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+					continue;
 				if (locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location) && location.table
-				    && table_descriptor(&location, &descriptor))
-					Dx12ShimNullSrv(shader->srv_dimension[slot], descriptor);
+				    && table_descriptor(&location, &descriptor)
+				    && !Dx12ShimNullSrv(shader->srv_dimension[slot], shader->srv_buffer[slot], descriptor))
+					return false;
 			}
 		}
 	}
@@ -3115,11 +3168,13 @@ static void apply_unbound_shader_resources(const ShimState *mod)
 			for (; _BitScanForward(&bit, mask); mask &= mask - 1) {
 				slot = word * 32 + bit;
 				if (locate(stage, D3D12_DESCRIPTOR_RANGE_TYPE_SRV, slot, &location) && location.table
-				    && table_descriptor(&location, &descriptor))
-					Dx12ShimNullSrv(scope->shaders[stage]->srv_dimension[slot], descriptor);
+				    && table_descriptor(&location, &descriptor)
+				    && !Dx12ShimNullSrv(scope->shaders[stage]->srv_dimension[slot], scope->shaders[stage]->srv_buffer[slot], descriptor))
+					return false;
 			}
 		}
 	}
+	return true;
 }
 
 // What the mod has bound to the slot, as a view of the game's list. False for
@@ -3232,24 +3287,26 @@ static bool write_extra_tables(const ShimState *mod, D3D12_GPU_DESCRIPTOR_HANDLE
 			cpu.ptr += dx12_shim_view_increment;
 		}
 		for (reg = 0; reg < SHIM_SRV_SLOTS; reg++) {
+			const Dx12ShaderInfo *shader = scope->shaders[stage];
+			BYTE dimension = shader ? shader->srv_dimension[reg] : 0;
 			const ShimView *view = NULL;
 
 			if (!(extension->extra.srv[stage][reg / 64] & 1ull << reg % 64))
 				continue;
-			if (bound->srv_mask[reg / 32] & 1u << reg % 32)
+			if (dimension != D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE && (bound->srv_mask[reg / 32] & 1u << reg % 32))
 				view = ShimViewOf(bound->srvs[reg]);
 			if (view && !view->resource->foreign && view->handle.ptr && Dx12ShimUseOnGameList(view->resource, scope->list))
 				dx12_shim->device->CopyDescriptorsSimple(1, cpu, view->handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-			else {
-				BYTE dimension = scope->shaders[stage] ? scope->shaders[stage]->srv_dimension[reg] : D3D_SRV_DIMENSION_TEXTURE2D;
-				Dx12ShimNullSrv(dimension ? dimension : D3D_SRV_DIMENSION_TEXTURE2D, cpu);
-			}
+			else if (!Dx12ShimNullSrv(dimension, shader ? shader->srv_buffer[reg] : 0, cpu))
+				return false;
 			cpu.ptr += dx12_shim_view_increment;
 		}
 		for (reg = 0; reg < 64; reg++) {
 			if (!(extension->extra.uav[stage] & 1ull << reg))
 				continue;
-			Dx12ShimNullUav(scope->shaders[stage] ? scope->shaders[stage]->uav_dimension[reg] : 0, cpu);
+			const Dx12ShaderInfo *shader = scope->shaders[stage];
+			if (!Dx12ShimNullUav(shader ? shader->uav_dimension[reg] : 0, shader ? shader->uav_buffer[reg] : 0, cpu))
+				return false;
 			cpu.ptr += dx12_shim_view_increment;
 		}
 	}
@@ -4074,7 +4131,7 @@ static bool skin_output_buffer(SkinOutput *output, UINT64 bytes, UINT stride)
 	desc.SampleDesc.Count = 1;
 	desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-	if (FAILED(Dx12ShimCreateResource(&desc, &output->buffer))) {
+	if (FAILED(Dx12ShimCreateResource(&desc, &output->buffer, nullptr))) {
 		output->buffer = NULL;
 		return false;
 	}
@@ -4793,10 +4850,12 @@ static void shader_info_of_mod(const ShimShader *shader, Dx12ShaderInfo *info)
 	info->srv[0] = shader->srv_used[0];
 	info->srv[1] = shader->srv_used[1];
 	memcpy(info->srv_dimension, shader->srv_dimension, sizeof(info->srv_dimension));
+	memcpy(info->srv_buffer, shader->srv_buffer, sizeof(info->srv_buffer));
 	info->cbv = shader->cbv_used;
 	info->uav = shader->uav_used;
 	info->samplers = shader->sampler_used;
 	memcpy(info->uav_dimension, shader->uav_dimension, min(sizeof(info->uav_dimension), sizeof(shader->uav_dimension)));
+	memcpy(info->uav_buffer, shader->uav_buffer, min(sizeof(info->uav_buffer), sizeof(shader->uav_buffer)));
 	info->targets = shader->targets;
 	info->bytecode = shader->bytecode.data();
 }
@@ -4991,6 +5050,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	ID3D12PipelineState *variant = NULL;
 	Dx12PipelineVariantDesc wanted = {};
 	const char *why = NULL;
+	bool unsupported_shader = false;
 	UINT stages = 0, patched_stages = 0, variant_stages;
 
 	if (scope->game_layout && mod->input_layout && mod->input_layout != scope->game_layout) {
@@ -5034,6 +5094,10 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 				}
 				continue;
 			}
+			if (!Dx12ShimSupportsShaderBindings(shader)) {
+				unsupported_shader = true;
+				break;
+			}
 			shader_info_of_mod(shader, &scope->mod_shaders[stage]);
 			wanted.shaders[stage] = &scope->mod_shaders[stage];
 			stages |= 1u << stage;
@@ -5047,6 +5111,10 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 			wanted.shaders[stage] = patched;
 			patched_stages |= 1u << stage;
 		}
+	}
+	if (unsupported_shader) {
+		wanted = {};
+		stages = patched_stages = 0;
 	}
 	// A pixel shader of a mod reads what the stage before it wrote in the
 	// D3D11 game, which the D3D12 game's may not all write
@@ -5114,10 +5182,10 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	if (stages && variant) {
 		stats.custom_draws++;
 		stats.custom_extended += scope->extension.signature != NULL;
-	} else if (stages || wanted.removed_stages && !variant) {
+	} else if (unsupported_shader || stages || wanted.removed_stages && !variant) {
 		stats.custom_failed++;
 		scope->custom_failed = true;
-		if (G->dx12_dump_hashes)
+		if (!unsupported_shader && G->dx12_dump_hashes)
 			note_custom_shader_failure(stages, why);
 	}
 	if (patched_stages && !variant && G->dx12_dump_hashes) {
@@ -5205,8 +5273,18 @@ static void apply_overrides(bool mod_draw)
 		for (mask = bound->cb_mask; _BitScanForward(&bit, mask); mask &= mask - 1)
 			apply_constant_buffer(stages[i], bit, bound);
 	}
-	if (scope->custom_stages || scope->patched_stages)
-		apply_unbound_shader_resources(mod);
+	if ((scope->custom_stages || scope->patched_stages) && !apply_unbound_shader_resources(mod)) {
+		restore_overrides();
+		use_root_signature(nullptr);
+		list->SetPipelineState(game->pipeline);
+		scope->variant = nullptr;
+		scope->extension.signature = nullptr;
+		scope->custom_stages = scope->patched_stages = 0;
+		scope->custom_failed = true;
+		for (auto stage : graphics_stages)
+			scope->shaders[stage] = scope->pipeline->shaders[stage];
+		return;
+	}
 	bind_changed_tables();
 
 	if (scope->compute)
@@ -6232,7 +6310,8 @@ static SlowReason draw_is_boring(Dx12GraphicsCommandList *list, const Dx12Pipeli
 
 		if (!shader || cb >= DX12_CB_SIZES || !shader->cb_bytes[cb])
 			continue;
-		if (*boring_constants_slot(stage, cb, shader->cb_bytes[cb], &word) != word)
+		auto cached = boring_constants_slot(stage, cb, shader->cb_bytes[cb], &word);
+		if (*cached != word)
 			return SLOW_CB;
 	}
 
@@ -6915,6 +6994,9 @@ void Dx12DrawPathFramePresented()
 			InterlockedExchange64(&dx12_stats.upload_pages_created, 0),
 			InterlockedExchange64(&dx12_stats.upload_pages_released, 0),
 			InterlockedExchange64(&dx12_stats.resources_renamed, 0));
+		Dx12DumpNote("  DX12 buffer replacements used %lld prepared buffer spares and made %lld synchronous allocation attempts\n",
+			InterlockedExchange64(&dx12_stats.prepared_spares_used, 0),
+			InterlockedExchange64(&dx12_stats.rename_allocations, 0));
 		note_memory();
 		stats = {};
 		reported_epoch = dx12_shim_epoch;

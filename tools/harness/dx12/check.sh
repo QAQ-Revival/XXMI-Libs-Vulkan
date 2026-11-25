@@ -18,6 +18,12 @@
 #   present  with 1 and 3 presents frame generation would add (harness.cpp
 #          generated=N), [Present] is left out of them, or with bb run again
 #          leaving the variables and ini params as the frame did
+#   blend-stream  a custom shader's blend state on game pipelines made from
+#          pipeline state streams (harness.cpp stream) gives the picture it
+#          gives on pipelines made from descriptions
+#   side   a mod's per-draw copy on lists of a second direct queue whose
+#          earlier wait is for a fence only the CPU signals (harness.cpp side)
+#          gives the picture it gives on the swap chain's queue
 #   ref    the pictures of test and of the mod in case/Mods against those of
 #          the ref folder (setup.sh ref <older d3d11.dll>)
 #   root-uav  game UAV ranges in root signatures 1.1/1.2, including table gaps
@@ -690,6 +696,56 @@ present_counts() {
 	sed -n 's/.*Frame generation presents: \([0-9]*\) left \[Present\] out, \([0-9]*\) ran it again$/\1 \2/p' run/present-$1.log 2>/dev/null | head -1
 }
 
+blend_picture() {
+	# blend_picture <name> <harness arguments>: the picture checksum, or
+	# "exit N" (124 when it did not finish in time)
+	local status
+	(cd run && timeout 60 ./harness.exe "${@:2}" dump=blend-$1.bmp >blend-$1.out 2>&1); status=$?
+	[ $status = 0 ] || { echo "exit $status"; return; }
+	sed -n 's/^picture checksum //p' run/blend-$1.out
+}
+
+run_blend_stream() {
+	local mod=run/Mods/mod/mod.ini frames=200 plain splain blend sblend
+	cp "$mod" "$mod.blend-backup" || { ok=0; return; }
+	plain=$(blend_picture plain frames=$frames)
+	splain=$(blend_picture stream-plain frames=$frames stream)
+	sed -i '/^\[TextureOverrideMesh100\]/,/^\[/{ s/^drawindexed = auto$/run = CustomShaderBlendTest/; }' "$mod"
+	printf '\n[CustomShaderBlendTest]\nblend = ADD BLEND_FACTOR INV_BLEND_FACTOR\nblend_factor[0] = 0.5\nblend_factor[1] = 0.5\nblend_factor[2] = 0.5\nblend_factor[3] = 1\ndrawindexed = auto\n' >> "$mod"
+	blend=$(blend_picture blend frames=$frames)
+	sblend=$(blend_picture stream-blend frames=$frames stream)
+	mv "$mod.blend-backup" "$mod"
+	if [[ "$plain" =~ ^[0-9a-f]+$ && "$blend" =~ ^[0-9a-f]+$ ]] && [ "$plain" = "$splain" ] && [ "$blend" = "$sblend" ] && [ "$blend" != "$plain" ]; then
+		echo "blend-stream: OK"
+	else
+		echo "blend-stream: FAILED (description: $plain, blended $blend; stream: $splain, blended $sblend)"; ok=0
+	fi
+}
+
+run_side() {
+	local mod=run/Mods/mod/mod.ini name status one side nomod
+	cp "$mod" "$mod.side-backup" || { ok=0; return; }
+	sed -i '/^\[TextureOverrideMesh100\]/,/^\[/{ s/^ps-t0 = ResourceModDiffuse$/ResourceSideDiffuse = copy ResourceModDiffuse\nps-t0 = ResourceSideDiffuse/; }' "$mod"
+	printf '\n[ResourceSideDiffuse]\n' >> "$mod"
+	# nomod: the mesh left to the game, which the other pictures must not be
+	for name in one side nomod; do
+		[ $name = nomod ] && sed -i '/^\[TextureOverrideMesh100\]/,/^\[/{ s/^hash = .*/hash = 00000000/; }' "$mod"
+		(cd run && timeout 60 ./harness.exe frames=600 $([ $name = side ] && echo side) dump=side-$name.bmp >side-$name.out 2>&1)
+		status=$?
+		if [ $status != 0 ]; then
+			mv "$mod.side-backup" "$mod"; echo "side: FAILED ($name: exit $status)"; ok=0; return
+		fi
+		printf -v "$name" '%s' "$(sed -n 's/^picture checksum //p' run/side-$name.out)"
+	done
+	mv "$mod.side-backup" "$mod"
+	if [[ "$one" =~ ^[0-9a-f]+$ && "$side" =~ ^[0-9a-f]+$ && "$nomod" =~ ^[0-9a-f]+$ ]] \
+	   && [ "$one" = "$side" ] && [ "$one" != "$nomod" ]; then
+		echo "side: OK"
+	else
+		echo "side: FAILED (one queue: $one, second queue: $side, without the mod: $nomod)"; ok=0
+	fi
+}
+
 run_present() {
 	local mod=run/Mods/mod/mod.ini frames=400 fail="" s0 s1 s3 snext b0 b1 b3 skips reruns bskips breruns
 	cp "$mod" "$mod.present-backup" || { ok=0; return; }
@@ -705,7 +761,7 @@ run_present() {
 	s3=$(present_picture 3 frames=$frames generated=3)
 	snext=$(present_picture next frames=$((frames + 1)))
 	# Long enough for the report of the first 5 s
-	present_picture long frames=4000 generated=1 >/dev/null
+	present_picture long frames=4000 min-ms=6000 generated=1 >/dev/null
 	read skips reruns <<< "$(present_counts long)"
 	# Using the swap chain's buffer has repeats run [Present] again, which
 	# leaves the variables and ini params as the frame did: the mesh shows
@@ -714,7 +770,7 @@ run_present() {
 	b0=$(present_picture bb0 frames=$frames)
 	b1=$(present_picture bb1 frames=$frames generated=1)
 	b3=$(present_picture bb3 frames=$frames generated=3)
-	present_picture bblong frames=4000 generated=1 >/dev/null
+	present_picture bblong frames=4000 min-ms=6000 generated=1 >/dev/null
 	read bskips breruns <<< "$(present_counts bblong)"
 
 	mv "$mod.present-backup" "$mod"
@@ -797,6 +853,8 @@ for what in ${@:-test refetch fold move lowmip filter present}; do
 	lowmip) run_lowmip ;;
 	filter) run_filter ;;
 	present) run_present ;;
+	blend-stream) run_blend_stream ;;
+	side) run_side ;;
 	ref) run_ref ;;
 	root-uav) run_root_uav ;;
 	dxil-iniparams) run_dxil_iniparams '' ;;

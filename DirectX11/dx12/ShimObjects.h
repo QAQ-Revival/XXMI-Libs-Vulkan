@@ -101,8 +101,9 @@ struct ShimResource {
 	D3D12_RESOURCE_DESC desc;
 	// What resource takes of the memory of the GPU, counted in dx12_memory
 	UINT64 allocated;
-	// Of the whole resource, as left by the commands recorded so far
 	D3D12_RESOURCE_STATES state;
+	std::vector<D3D12_RESOURCE_STATES> subresource_states;
+	UINT plane_count = 0;
 	// Every submission leaves the resources it used in the common state,
 	// see Bridge.h. touched_epoch tells which those are.
 	UINT touched_epoch;
@@ -117,6 +118,7 @@ struct ShimResource {
 	// Belongs to the game, like a back buffer. Not referenced: whoever
 	// made the wrapper clears resource when the game lets go of it.
 	bool foreign;
+	ID3D12CommandQueue *present_queue = nullptr;
 	// Where a constant buffer of the game is, if that is memory a list of
 	// ours can read whatever the game is doing with it. Dx12ShimBufferAddress
 	// returns it.
@@ -133,6 +135,7 @@ struct ShimResource {
 	// rewritten between draws correct whatever order command lists are
 	// executed in.
 	bool cpu_only;
+	bool prepare_spares_on_pin = false;
 	// Contents as last written through Map or UpdateSubresource. Always
 	// there for cpu_only buffers, otherwise only for what the engine may
 	// map: subresource 0 with tightly packed rows.
@@ -218,6 +221,26 @@ struct ShimResource {
 	};
 	std::vector<Spare> spares;
 	size_t spare_index;
+
+	// The loader fills this without the shim lock. At present the shim
+	// counts the resource on its first copy and keeps it staged until all
+	// copies have been recorded.
+	struct Staged {
+		Dx12StagedUpload upload;
+		UINT64 allocated;
+		UINT64 residency;
+		UINT64 copy_fence;
+		bool counted;
+		std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts;
+		std::vector<UINT> rows;
+		std::vector<UINT64> row_sizes;
+		std::vector<bool> written;
+		UINT next_subresource;
+		UINT next_band;
+		UINT64 buffer_bytes;
+		UINT64 buffer_offset;
+	};
+	Staged *staged = nullptr;
 };
 
 // Not to be used for now, though it may be later: evicted and not made
@@ -225,7 +248,7 @@ struct ShimResource {
 // What finds Dx12ShimTransition failing for it is to be tried again.
 static inline bool ShimNotReady(const ShimResource *resource)
 {
-	return resource->evicted || !resource->deferred_writes.empty();
+	return resource->evicted || resource->write_pending || !resource->deferred_writes.empty();
 }
 
 void ShimDestroyResource(ShimResource *resource);
@@ -353,8 +376,10 @@ struct ShimView {
 	ID3D11Resource *resource11;
 	ShimResource *resource;
 	DXGI_FORMAT format;
-	// Depth stencil views that do not write
-	bool read_only;
+	struct Range {
+		UINT mip = 0, mips = 1, slice = 0, slices = 1, planes = 1;
+	} range;
+	UINT read_only_planes = 0;
 	// What the descriptor was made with, to make it again on another
 	// D3D12 resource (ShimRecreateView)
 	enum Kind { SRV, UAV, RTV, DSV } kind;
@@ -365,6 +390,11 @@ struct ShimView {
 		D3D12_DEPTH_STENCIL_VIEW_DESC dsv;
 	} desc12;
 };
+
+void ShimSetViewRange(ShimView *view);
+bool ShimViewsOverlap(const ShimView *a, const ShimView *b, UINT planes);
+UINT ShimTextureArraySize(const D3D12_RESOURCE_DESC &desc);
+UINT ShimPlaneCount(ShimResource *resource);
 
 void ShimDestroyView(ShimView *view);
 // Writes the descriptor again, for the D3D12 resource the view's resource
@@ -461,12 +491,10 @@ struct ShimShader {
 	UINT64 hash;
 	std::vector<BYTE> bytecode;
 
-	// What the shader reads, from its reflection: highest register + 1 of
-	// each kind, a bit per register it really uses, and what kind of
-	// resource it expects where, for binding nothing. The masks are all
-	// zero where it could not be read (reflected).
 	bool reflected;
 	bool dxil;
+	bool unsupported_srv_range;
+	bool uses_acceleration_structure;
 	// The same shader compiled to DXIL (Dx12DxcCompile), for the pipelines
 	// of the game whose own shaders are: a pipeline state does not take
 	// DXBC and DXIL together. NULL if there is none. Owned.
@@ -474,6 +502,7 @@ struct ShimShader {
 	// How many render targets a pixel shader writes
 	UINT targets;
 	UINT cbv_count;
+	// Number of set bits in srv_used, for reserving the packed table.
 	UINT srv_count;
 	UINT sampler_count;
 	UINT uav_count;
@@ -483,6 +512,8 @@ struct ShimShader {
 	UINT64 uav_used;
 	BYTE srv_dimension[SHIM_SRV_SLOTS];
 	BYTE uav_dimension[SHIM_UAV_SLOTS];
+	UINT16 srv_buffer[SHIM_SRV_SLOTS];
+	UINT16 uav_buffer[SHIM_UAV_SLOTS];
 };
 
 void ShimDestroyShader(ShimShader *shader);

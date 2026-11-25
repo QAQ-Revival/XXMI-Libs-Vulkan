@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -143,28 +145,60 @@ void ReleaseIdleReadBuffers()
 	VirtualFree(released, 0, MEM_RELEASE);
 }
 
+bool FileIdentity::operator==(const FileIdentity &other) const
+{
+	return index && change_time && volume == other.volume && index == other.index && size == other.size
+		&& write_time == other.write_time && change_time == other.change_time;
+}
+
 FileContents::FileContents(const wchar_t *path)
 {
-	LARGE_INTEGER file_size;
-	HANDLE file;
-	size_t want;
+	if (open(path))
+		read();
+}
 
+bool FileContents::open(const wchar_t *path)
+{
+	BY_HANDLE_FILE_INFORMATION info;
+
+	this->path = path;
 	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
 			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OVERLAPPED, NULL);
 	if (file == INVALID_HANDLE_VALUE) {
 		error = GetLastError();
-		return;
+		return false;
 	}
 
-	if (!GetFileSizeEx(file, &file_size) || file_size.QuadPart <= 0
-			|| (uint64_t)file_size.QuadPart > (uint64_t)SIZE_MAX) {
+	if (!GetFileInformationByHandle(file, &info)) {
 		error = GetLastError();
-		if (!error)
-			error = ERROR_FILE_INVALID;
 		CloseHandle(file);
-		return;
+		file = INVALID_HANDLE_VALUE;
+		return false;
 	}
-	want = (size_t)file_size.QuadPart;
+	FILE_BASIC_INFO basic;
+	if (GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)))
+		identity.change_time = basic.ChangeTime.QuadPart;
+	identity.volume = info.dwVolumeSerialNumber;
+	identity.index = (uint64_t)info.nFileIndexHigh << 32 | info.nFileIndexLow;
+	identity.size = (uint64_t)info.nFileSizeHigh << 32 | info.nFileSizeLow;
+	identity.write_time = (uint64_t)info.ftLastWriteTime.dwHighDateTime << 32 | info.ftLastWriteTime.dwLowDateTime;
+
+	if (!identity.size || identity.size > (uint64_t)SIZE_MAX) {
+		error = ERROR_FILE_INVALID;
+		CloseHandle(file);
+		file = INVALID_HANDLE_VALUE;
+		return false;
+	}
+	return true;
+}
+
+bool FileContents::read()
+{
+	size_t want;
+
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	want = (size_t)identity.size;
 
 	if (want <= kept_read_buffer_size) {
 		std::lock_guard<std::mutex> lock(read_buffers_lock);
@@ -197,7 +231,8 @@ FileContents::FileContents(const wchar_t *path)
 			capacity = 0;
 			error = ERROR_NOT_ENOUGH_MEMORY;
 			CloseHandle(file);
-			return;
+			file = INVALID_HANDLE_VALUE;
+			return false;
 		}
 	}
 
@@ -205,18 +240,20 @@ FileContents::FileContents(const wchar_t *path)
 		Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_FILE_READ, path, want);
 		error = ReadWhole(file, buffer, want);
 	}
-	if (!error)
-		has_identity = GetFileIdentity(file, &file_identity);
 	CloseHandle(file);
+	file = INVALID_HANDLE_VALUE;
 	if (error)
-		return;
+		return false;
 
 	data = buffer;
 	size = want;
+	return true;
 }
 
 FileContents::~FileContents()
 {
+	if (file != INVALID_HANDLE_VALUE)
+		CloseHandle(file);
 	if (!buffer)
 		return;
 
@@ -238,14 +275,6 @@ FileContents::~FileContents()
 	}
 	if (buffer)
 		VirtualFree(buffer, 0, MEM_RELEASE);
-}
-
-bool FileContents::identity(FileIdentity *identity) const
-{
-	if (!has_identity)
-		return false;
-	*identity = file_identity;
-	return true;
 }
 
 #pragma endregion FileContents
@@ -350,55 +379,6 @@ void MappedFile::prefetch() const
 
 #pragma endregion MappedFile
 
-#pragma region FileIdentity
-
-bool FileIdentity::operator==(const FileIdentity &other) const
-{
-	return volume == other.volume
-		&& index == other.index
-		&& size == other.size
-		&& last_write == other.last_write
-		&& change == other.change;
-}
-
-bool GetFileIdentity(HANDLE file, FileIdentity *identity)
-{
-	BY_HANDLE_FILE_INFORMATION info;
-	FILE_BASIC_INFO basic;
-
-	if (!GetFileInformationByHandle(file, &info)
-			|| !GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)))
-		return false;
-
-	// A file system without file IDs cannot tell two files apart:
-	if (!info.nFileIndexHigh && !info.nFileIndexLow)
-		return false;
-
-	identity->volume = info.dwVolumeSerialNumber;
-	identity->index = ((uint64_t)info.nFileIndexHigh << 32) | info.nFileIndexLow;
-	identity->size = ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
-	identity->last_write = basic.LastWriteTime.QuadPart;
-	identity->change = basic.ChangeTime.QuadPart;
-	return true;
-}
-
-bool GetFileIdentity(const wchar_t *path, FileIdentity *identity)
-{
-	HANDLE file;
-	bool ok;
-
-	file = CreateFileW(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-			NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (file == INVALID_HANDLE_VALUE)
-		return false;
-
-	ok = GetFileIdentity(file, identity);
-	CloseHandle(file);
-	return ok;
-}
-
-#pragma endregion FileIdentity
-
 #pragma region SharedFileResources
 
 bool SharedResourceKey::operator==(const SharedResourceKey &other) const
@@ -451,6 +431,8 @@ struct SharedEntry
 	ID3D11Resource *resource;
 	// The config generation that last used it:
 	unsigned generation;
+	bool provisional;
+	uint64_t id;
 };
 
 static std::mutex shared_resources_lock;
@@ -459,11 +441,47 @@ static std::unordered_map<uint64_t, std::vector<SharedEntry>> shared_resources;
 // Counts config reloads:
 static unsigned shared_generation = 0;
 
+static uint64_t next_shared_id = 0;
+static thread_local bool provisional_visible;
+
+SharedProvisionalScope::SharedProvisionalScope()
+{
+	provisional_visible = true;
+}
+
+SharedProvisionalScope::~SharedProvisionalScope()
+{
+	provisional_visible = false;
+}
+
+// Read a part at a time into a small reused buffer: a whole second copy of a
+// large file would take a large buffer of its own, allocated afresh each time
 static bool FileContentsEqual(const std::wstring &path, const void *data, size_t size)
 {
-	FileContents file(path.c_str());
+	thread_local std::unique_ptr<uint8_t[]> part;
+	const size_t part_size = 4 << 20;
+	LARGE_INTEGER file_size;
+	HANDLE file;
+	bool equal;
 
-	return file.valid() && file.size == size && !memcmp(file.data, data, size);
+	file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	equal = GetFileSizeEx(file, &file_size) && (uint64_t)file_size.QuadPart == size;
+	if (equal && !part)
+		part.reset(new (std::nothrow) uint8_t[part_size]);
+	equal = equal && part;
+
+	for (size_t done = 0; equal && done < size; ) {
+		DWORD want = (DWORD)std::min<size_t>(part_size, size - done), got = 0;
+
+		equal = ReadFile(file, part.get(), want, &got, NULL) && got == want
+			&& !memcmp(part.get(), (const uint8_t*)data + done, want);
+		done += want;
+	}
+	CloseHandle(file);
+	return equal;
 }
 
 // Adds the file to those the entry is known by, or updates its identity:
@@ -484,14 +502,9 @@ static void RememberSharedFile(SharedEntry &entry, const std::wstring &path, con
 }
 
 ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size,
-		const std::wstring *path, const FileIdentity *path_identity)
+		const std::wstring &path, const FileIdentity &identity)
 {
-	struct Candidate {
-		ID3D11Resource *resource;
-		std::vector<std::wstring> paths;
-	};
-	std::vector<Candidate> candidates;
-	ID3D11Resource *match = nullptr;
+	std::vector<SharedEntry> candidates;
 	Profiling::Spike::Scope spike(Profiling::Spike::RESOURCE_FILE_SHARE, L"bytes", size);
 
 	// Hashed from the data the caller is about to upload, never from the
@@ -508,64 +521,38 @@ ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data,
 			return nullptr;
 
 		for (const SharedEntry &entry : bucket->second) {
-			if (entry.key == key) {
-				Candidate candidate{entry.resource};
-				for (const SharedFile &file : entry.files)
-					candidate.paths.push_back(file.path);
-				entry.resource->AddRef();
-				candidates.push_back(std::move(candidate));
-			}
+			if (entry.key == key && (!entry.provisional || provisional_visible))
+				candidates.push_back(entry);
 		}
 	}
 
-	// The hash only selects candidates. A candidate is shared once one of
-	// its files still compares equal byte for byte; one whose files have
-	// all since changed or disappeared is simply not shared with:
-	for (const Candidate &candidate : candidates) {
-		bool equal = false;
-		if (!match) {
-			for (const std::wstring &candidate_path : candidate.paths) {
-				if (FileContentsEqual(candidate_path, data, size)) {
-					equal = true;
-					break;
-				}
-			}
-		}
-		if (equal)
-			match = candidate.resource;
-		else
-			candidate.resource->Release();
-	}
+	// The hash only selects candidates. A candidate is shared once its
+	// file still compares equal byte for byte; one whose file has since
+	// changed or disappeared is simply not shared with:
+	for (const SharedEntry &candidate : candidates) {
+		const bool equal = std::any_of(candidate.files.begin(), candidate.files.end(), [&](const SharedFile &file) {
+			return FileContentsEqual(file.path, data, size);
+		});
+		if (!equal)
+			continue;
 
-	// Known by this file too from now on, so the next config finds it by
-	// identity, and keeps it while any of its files is still in use:
-	if (match && path) {
+		// The render thread may discard a provisional upload during the comparison.
+		// Recheck the registration before taking a reference on the loader thread.
 		std::lock_guard<std::mutex> lock(shared_resources_lock);
-
 		auto bucket = shared_resources.find(key.size);
-		if (bucket != shared_resources.end()) {
-			for (SharedEntry &entry : bucket->second) {
-				if (entry.resource == match && entry.key == key) {
-					RememberSharedFile(entry, *path, path_identity);
-					entry.generation = shared_generation;
-					break;
-				}
+		if (bucket == shared_resources.end())
+			continue;
+		for (SharedEntry &entry : bucket->second) {
+			if (entry.id == candidate.id && (!entry.provisional || provisional_visible)) {
+				RememberSharedFile(entry, path, &identity);
+				entry.generation = shared_generation;
+				entry.resource->AddRef();
+				return entry.resource;
 			}
 		}
 	}
 
-	return match;
-}
-
-void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, ID3D11Resource *resource,
-		const FileIdentity *path_identity)
-{
-	std::lock_guard<std::mutex> lock(shared_resources_lock);
-	SharedEntry entry{key, {}, resource, shared_generation};
-
-	RememberSharedFile(entry, path, path_identity);
-	resource->AddRef();
-	shared_resources[key.size].push_back(std::move(entry));
+	return nullptr;
 }
 
 ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std::wstring &path,
@@ -583,6 +570,10 @@ ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std
 			return nullptr;
 
 		for (auto entry = bucket->second.begin(); entry != bucket->second.end(); ) {
+			if (entry->provisional && !provisional_visible) {
+				entry++;
+				continue;
+			}
 			bool stale = false;
 
 			for (auto file = entry->files.begin(); file != entry->files.end(); ) {
@@ -605,7 +596,7 @@ ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std
 				file++;
 			}
 
-			if (stale && entry->files.empty()) {
+			if (stale && entry->files.empty() && !entry->provisional) {
 				released.push_back(entry->resource);
 				entry = bucket->second.erase(entry);
 				continue;
@@ -648,6 +639,10 @@ void RetainSharedFileResources(const std::unordered_set<std::wstring> &lower_pat
 				// One that went unused since the previous reload goes,
 				// so a resource whose section was changed to load the
 				// file differently does not linger:
+				if (entry->provisional) {
+					entry++;
+					continue;
+				}
 				if (entry->generation == shared_generation) {
 					auto &files = entry->files;
 					files.erase(std::remove_if(files.begin(), files.end(), [&](const SharedFile &file) {
@@ -676,6 +671,54 @@ void RetainSharedFileResources(const std::unordered_set<std::wstring> &lower_pat
 	// Released outside the lock: the final Release() calls into the driver.
 	for (ID3D11Resource *resource : released)
 		resource->Release();
+}
+
+void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, const FileIdentity &identity,
+		ID3D11Resource *resource, bool provisional)
+{
+	std::lock_guard<std::mutex> lock(shared_resources_lock);
+	std::vector<SharedEntry> &bucket = shared_resources[key.size];
+
+	if (!provisional) {
+		for (SharedEntry &entry : bucket) {
+			if (entry.resource == resource && entry.provisional) {
+				entry.provisional = false;
+				entry.generation = shared_generation;
+				RememberSharedFile(entry, path, &identity);
+				return;
+			}
+		}
+	}
+	resource->AddRef();
+	SharedEntry entry{key, {}, resource, shared_generation, provisional, ++next_shared_id};
+	RememberSharedFile(entry, path, &identity);
+	bucket.push_back(std::move(entry));
+}
+
+void DropProvisionalShare(ID3D11Resource *resource)
+{
+	ID3D11Resource *released = nullptr;
+
+	{
+		std::lock_guard<std::mutex> lock(shared_resources_lock);
+
+		for (auto bucket = shared_resources.begin(); !released && bucket != shared_resources.end(); bucket++) {
+			std::vector<SharedEntry> &entries = bucket->second;
+			for (auto entry = entries.begin(); entry != entries.end(); entry++) {
+				if (entry->resource == resource && entry->provisional) {
+					released = resource;
+					entries.erase(entry);
+					break;
+				}
+			}
+			if (released && entries.empty()) {
+				shared_resources.erase(bucket);
+				break;
+			}
+		}
+	}
+	if (released)
+		released->Release();
 }
 
 void ReleaseSharedFileResources(ID3D11Device *device)

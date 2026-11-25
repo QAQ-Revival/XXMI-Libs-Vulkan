@@ -18,8 +18,8 @@ python tools\harness\shader-scope\check.py --exe C:\temp\scope-build\harness.exe
 
 The check copies the DLL/dependencies into isolated test folders. It does not
 change the supplied DLL, installed importer, or global configuration. The
-output directory must not already exist. It needs Python 3.12+, VS2022 C++,
-the Windows SDK, and working D3D11/D3D12 WARP runtimes. No physical input is sent.
+output directory must not already exist. It needs Python 3.12+, VS 2026 18.12 or later with MSVC 14.52 or later,
+Windows SDK 10.0.26100.0, and working D3D11/D3D12 WARP runtimes. No physical input is sent.
 
 The original red triangle uses indices 3..5. A mesh override submits a red
 triangle from indices 0..2 of its replacement buffer; indices 3..5 of that
@@ -53,4 +53,16 @@ Run the draw-order checker tests without a DLL or graphics runtime:
 
 ```bat
 python -m unittest discover -s tools/harness/shader-scope -p test_check.py
+```
+
+The shim regression probe uses the matching DLL and PDB from a local Release
+build. It checks buffer copies, depth and stencil bindings, disjoint texture
+subresources, structured buffer strides in stripped DXIL, and foreign queue
+retirement. The resize probes check back-buffer wrappers, per-buffer queue
+selection, and propagation of device removal. They use the release runtime
+because the debug layer can terminate the process during an explicit queue
+resize.
+
+```bat
+python tools\harness\shader-scope\check_shim.py --exe C:\temp\scope-build\harness.exe --dll x64\Release\d3d11.dll --dxc "%WindowsSdkVerBinPath%x64\dxc.exe" --output C:\temp\shim-results
 ```

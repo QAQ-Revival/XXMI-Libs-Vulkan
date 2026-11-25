@@ -1,5 +1,7 @@
 #include "ResourceHash.h"
 
+#include <bit>
+
 #include <INITGUID.h>
 #include "log.h"
 #include "util.h"
@@ -8,11 +10,7 @@
 #include "overlay.h"
 #include "vk/VkScope.h"
 
-// DirectXTK headers fail to include their own pre-requisits. We just want
-// GetSurfaceInfo from LoaderHelpers
-#include "DirectXTK/Src/pch.h"
-#include "DirectXTK/Src/PlatformHelpers.h"
-#include "DirectXTK/Src/LoaderHelpers.h"
+#include <DirectXTex.h>
 
 // Overloaded functions to log any kind of resource description (useful to call
 // from templates):
@@ -718,7 +716,15 @@ static uint32_t hash_tex2d_data(uint32_t hash, const void *data, size_t length,
 	if (!zero_padding && !skip_padding)
 		return crc32c_hw(hash, data, length);
 
-	DirectX::LoaderHelpers::GetSurfaceInfo(pDesc->Width, pDesc->Height, pDesc->Format, &slice_pitch, &row_pitch, &row_count);
+	HRESULT hr = DirectX::ComputePitch(pDesc->Format, pDesc->Width, pDesc->Height, row_pitch, slice_pitch);
+
+	if (FAILED(hr))
+		return crc32c_hw(hash, data, length);
+
+	row_count = DirectX::ComputeScanlines(pDesc->Format, pDesc->Height);
+
+	if (!row_count)
+		return crc32c_hw(hash, data, length);
 
 	uint8_t *sptr = (uint8_t*)data;
 	size_t msize = min(row_pitch, mapped_row_pitch);
@@ -881,18 +887,20 @@ ResourceHandleInfo* GetResourceHandleInfo(ID3D11Resource *resource)
 {
 	std::unordered_map<ID3D11Resource *, ResourceHandleInfo>::iterator j;
 	ResourceHandleInfo* ret = NULL;
-	TLS::ResourceHandleCacheEntry *entry = &get_tls()->resource_handle_cache[
+	TLS::ResourceHandleCacheSet *set = &get_tls()->resource_handle_cache[
 		((uint64_t)(uintptr_t)resource * 0x9E3779B97F4A7C15ull) >> (64 - TLS::RESOURCE_HANDLE_CACHE_BITS)];
 	// Read before the lookup: an erase bumps it under the lock first, so
 	// an entry found before the erase is cached as stale already
 	unsigned generation = G->resource_erase_generation;
 
-	if (entry->resource == resource && entry->generation == generation) {
-		if (Profiling::mode == Profiling::Mode::SUMMARY) {
-			Profiling::texture_handle_info_lookup_overhead.count++;
-			Profiling::texture_handle_info_lookup_overhead.hits++;
+	for (int way = 0; way < 2; way++) {
+		if (set->resource[way] == resource && set->generation[way] == generation) {
+			if (Profiling::mode == Profiling::Mode::SUMMARY) {
+				Profiling::texture_handle_info_lookup_overhead.count++;
+				Profiling::texture_handle_info_lookup_overhead.hits++;
+			}
+			return set->info[way];
 		}
-		return entry->info;
 	}
 
 	EnterCriticalSectionPretty(&G->mResourcesLock);
@@ -904,9 +912,12 @@ ResourceHandleInfo* GetResourceHandleInfo(ID3D11Resource *resource)
 	LeaveCriticalSection(&G->mResourcesLock);
 
 	if (ret) {
-		entry->resource = resource;
-		entry->info = ret;
-		entry->generation = generation;
+		set->resource[1] = set->resource[0];
+		set->info[1] = set->info[0];
+		set->generation[1] = set->generation[0];
+		set->resource[0] = resource;
+		set->info[0] = ret;
+		set->generation[0] = generation;
 	}
 	return ret;
 }
@@ -2292,7 +2303,7 @@ static void collect_fuzzy_texture_overrides_for_resource(ID3D11Resource *resourc
 // - The resource hash changes (track_texture_updates)
 // - The TextureOverride sections are reloaded
 // The latter two and adding entries are serialised by G->mCriticalSection.
-#define TEXTURE_OVERRIDE_MISS_CACHE_BITS 14
+#define TEXTURE_OVERRIDE_MISS_CACHE_BITS 16
 static std::atomic<ID3D11Resource*> texture_override_miss_cache[1 << TEXTURE_OVERRIDE_MISS_CACHE_BITS];
 
 static inline std::atomic<ID3D11Resource*>* texture_override_miss_slot(ID3D11Resource *resource)
@@ -2406,6 +2417,20 @@ public:
 		return ret;
 	}
 };
+
+bool TextureOverrideResourceKnownMiss(ID3D11Resource *resource)
+{
+	if (G->mTextureOverrideMap.empty() && G->mFuzzyTextureOverrides.empty())
+		return true;
+	if (texture_override_miss_slot(resource)->load(std::memory_order_relaxed) != resource)
+		return false;
+
+	// As find_texture_overrides_for_resource() counts the lookup it ends
+	// in its miss cache:
+	if (Profiling::mode == Profiling::Mode::SUMMARY)
+		Profiling::texture_override_candidates_lookup_overhead.count++;
+	return true;
+}
 
 bool TextureOverrideViewKnownMiss(ID3D11View *view)
 {
@@ -2924,7 +2949,7 @@ uint8_t* ResourceHandleInfo::GetCachedData() {
 struct LazyDataCache {
 	static const size_t PAGE = 256;
 
-	std::function<void(uint8_t *dst, size_t offset, size_t size)> read;
+	std::move_only_function<void(uint8_t *dst, size_t offset, size_t size)> read;
 	size_t size;
 	std::vector<bool> pages;
 
@@ -2937,6 +2962,8 @@ uint8_t* ResourceHandleInfo::GetCachedData(size_t offset, size_t size)
 	size_t page, first, start = cached_data_offset + offset;
 
 	if (lazy && size && start < lazy->size) {
+		if (!lazy->read)
+			throw std::bad_function_call{};
 		size = min(size, lazy->size - start);
 		for (page = start / LazyDataCache::PAGE; page * LazyDataCache::PAGE < start + size;) {
 			if (lazy->pages[page]) {
@@ -2953,7 +2980,7 @@ uint8_t* ResourceHandleInfo::GetCachedData(size_t offset, size_t size)
 	return GetCachedData();
 }
 
-void ResourceHandleInfo::SetLazyDataCache(size_t size, std::function<void(uint8_t *dst, size_t offset, size_t size)> read)
+void ResourceHandleInfo::SetLazyDataCache(size_t size, std::move_only_function<void(uint8_t *dst, size_t offset, size_t size)> read)
 {
 	if (cached_data && cached_data.use_count() == 1 && !cached_data_offset && cached_data_size == size) {
 		LazyDataCache *existing = std::get_deleter<LazyDataCache>(cached_data);
@@ -3722,5 +3749,5 @@ unsigned HammingDistance(uint64_t a, uint64_t b)
 	if ((a == 0) != (b == 0))
 		return 64;
 
-	return static_cast<unsigned>(__popcnt64(a ^ b));
+	return std::popcount(a ^ b);
 }

@@ -8,6 +8,7 @@
 #include "ShimContext.h"
 #include "ShimPipeline.h"
 #include "util.h"
+#include "../ModLoading.h"
 #include "../profiling.h"
 
 #include "../globals.h"
@@ -95,16 +96,16 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CheckFormatSupport(DXGI_FORMAT Format, UIN
 
 // The earlier writes this one covers are dropped, so that a resource written
 // every frame while it stays evicted keeps one
-static void defer_write(ShimResource *resource, UINT subresource, UINT64 offset, UINT row_pitch, const void *data, UINT64 size)
+static void defer_write(ShimResource *resource, UINT subresource, UINT64 offset, UINT row_pitch, std::vector<BYTE> data)
 {
 	auto &writes = resource->deferred_writes;
 	bool buffer = resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
 
 	writes.erase(std::remove_if(writes.begin(), writes.end(), [&](const ShimResource::DeferredWrite &write) {
 		return write.subresource == subresource
-			&& (!buffer || (write.offset >= offset && write.offset + write.data.size() <= offset + size));
+			&& (!buffer || (write.offset >= offset && write.offset + write.data.size() <= offset + data.size()));
 	}), writes.end());
-	writes.push_back({ subresource, offset, row_pitch, std::vector<BYTE>((const BYTE*)data, (const BYTE*)data + size) });
+	writes.push_back({ subresource, offset, row_pitch, std::move(data) });
 }
 
 bool ShimApplyDeferredWrites(ShimResource *resource)
@@ -114,17 +115,20 @@ bool ShimApplyDeferredWrites(ShimResource *resource)
 	// that is still all of the contents has them already
 	bool shadow_whole = resource->shadow_version == resource->version;
 	size_t i;
+	bool pending = resource->write_pending;
 
 	// First, as writing goes through Dx12ShimTransition itself
 	writes.swap(resource->deferred_writes);
+	resource->write_pending = false;
 	for (i = 0; i < writes.size(); i++) {
 		const auto &write = writes[i];
 
 		if (resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
-		    ? !ShimWriteBuffer(resource, write.offset, write.data.data(), write.data.size())
-		    : !ShimWriteSubresource(resource, write.subresource, write.data.data(), write.row_pitch, 0))
+		    ? !ShimWriteBuffer(resource, write.offset, write.data.data(), write.data.size(), false)
+		    : !ShimWriteSubresource(resource, write.subresource, write.data.data(), write.row_pitch, 0, false))
 			break;
 	}
+	resource->write_pending = pending;
 	if (shadow_whole)
 		resource->shadow_version = resource->version;
 	if (i == writes.size())
@@ -135,7 +139,7 @@ bool ShimApplyDeferredWrites(ShimResource *resource)
 	return false;
 }
 
-bool ShimWriteBuffer(ShimResource *resource, UINT64 offset, const void *data, UINT64 size)
+bool ShimWriteBuffer(ShimResource *resource, UINT64 offset, const void *data, UINT64 size, bool allow_defer)
 {
 	ID3D12Resource *upload_buffer;
 	UINT64 upload_offset;
@@ -153,7 +157,10 @@ bool ShimWriteBuffer(ShimResource *resource, UINT64 offset, const void *data, UI
 	}
 
 	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_DEST)) {
-		defer_write(resource, 0, offset, 0, data, size);
+		if (!allow_defer)
+			return false;
+		const BYTE *bytes = static_cast<const BYTE*>(data);
+		defer_write(resource, 0, offset, 0, std::vector<BYTE>(bytes, bytes + size));
 		resource->version++;
 		return true;
 	}
@@ -178,12 +185,22 @@ void ShimFootprint(ShimResource *resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT *l
 		*total = resource->footprint_total;
 }
 
-bool ShimWriteSubresource(ShimResource *resource, UINT subresource, const void *data, UINT row_pitch, UINT slice_pitch)
+static void copy_texture_rows(BYTE *dst, SIZE_T dst_pitch, const BYTE *src, SIZE_T src_pitch, SIZE_T src_slice_pitch,
+		SIZE_T row_size, UINT rows, UINT depth)
+{
+	for (UINT z = 0; z < depth; z++) {
+		for (UINT y = 0; y < rows; y++)
+			memcpy(dst + ((SIZE_T)z * rows + y) * dst_pitch, src + z * src_slice_pitch + y * src_pitch, row_size);
+	}
+}
+
+bool ShimWriteSubresource(ShimResource *resource, UINT subresource, const void *data, UINT row_pitch, UINT slice_pitch,
+		bool allow_defer)
 {
 	D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout;
 	D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
 	UINT64 row_size, total, upload_offset;
-	UINT rows, y, z;
+	UINT rows;
 	BYTE *upload;
 
 	if (!resource->resource || !data)
@@ -200,43 +217,45 @@ bool ShimWriteSubresource(ShimResource *resource, UINT subresource, const void *
 	if (!upload)
 		return false;
 
-	if (!row_pitch)
-		row_pitch = (UINT)row_size;
-	if (!slice_pitch)
-		slice_pitch = row_pitch * rows;
+	const BYTE *bytes = static_cast<const BYTE*>(data);
+	const SIZE_T src_pitch = row_pitch ? row_pitch : (SIZE_T)row_size;
+	const SIZE_T src_slice_pitch = slice_pitch ? slice_pitch : src_pitch * rows;
+	// The transition may give the resource another D3D12 resource.
+	if (!Dx12ShimTransitionSubresource(resource, subresource, D3D12_RESOURCE_STATE_COPY_DEST, true)) {
+		if (!allow_defer)
+			return false;
+		std::vector<BYTE> packed((size_t)row_size * rows * layout.Footprint.Depth);
+		copy_texture_rows(packed.data(), (SIZE_T)row_size, bytes, src_pitch, src_slice_pitch,
+			(SIZE_T)row_size, rows, layout.Footprint.Depth);
+		defer_write(resource, subresource, 0, (UINT)row_size, std::move(packed));
+		resource->version++;
+		return true;
+	}
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_COPY, L"texture bytes", total);
-		for (z = 0; z < layout.Footprint.Depth; z++) {
-			for (y = 0; y < rows; y++) {
-				memcpy(upload + ((SIZE_T)z * rows + y) * layout.Footprint.RowPitch,
-					(const BYTE*)data + (SIZE_T)z * slice_pitch + (SIZE_T)y * row_pitch, (size_t)row_size);
-			}
-		}
+		copy_texture_rows(upload, layout.Footprint.RowPitch, bytes, src_pitch, src_slice_pitch,
+			(SIZE_T)row_size, rows, layout.Footprint.Depth);
 	}
 
+	dst.pResource = resource->resource;
 	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 	dst.SubresourceIndex = subresource;
 	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
 	src.PlacedFootprint = layout;
 	src.PlacedFootprint.Offset = upload_offset;
 
-	// The transition may give the resource another D3D12 resource
-	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_DEST)) {
-		defer_write(resource, subresource, 0, layout.Footprint.RowPitch, upload, total);
-		resource->version++;
-		return true;
-	}
-	dst.pResource = resource->resource;
 	Dx12ShimList()->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
 	return true;
 }
 
-void ShimFlushWrite(ShimResource *resource)
+bool ShimFlushWrite(ShimResource *resource)
 {
 	// First, as writing goes through Dx12ShimTransition itself
 	resource->write_pending = false;
-	// The rows of a shadow are as far apart as those of the upload
-	ShimWriteSubresource(resource, 0, resource->shadow.data(), 0, 0);
+	if (ShimWriteSubresource(resource, 0, resource->shadow.data(), 0, 0, false))
+		return true;
+	resource->write_pending = true;
+	return false;
 }
 
 static D3D12_RESOURCE_FLAGS resource_flags(UINT bind_flags)
@@ -276,13 +295,204 @@ void ShimCountResource(ShimResource *resource, int sign)
 	Dx12ShimTrackResidency(resource, sign > 0);
 }
 
+// Set on the loader thread of ModLoading.h, see Dx12StagingScope
+static thread_local bool staging;
+
+Dx12StagingScope::Dx12StagingScope()
+{
+	staging = true;
+}
+
+Dx12StagingScope::~Dx12StagingScope()
+{
+	staging = false;
+}
+
+bool Dx12IsShimDevice(ID3D11Device *device)
+{
+	return dx12_shim && device == static_cast<ID3D11Device*>(dx12_shim->shim_device);
+}
+
+static void count_staged_resource(ShimResource *resource)
+{
+	ShimResource::Staged *staged = resource->staged;
+
+	if (staged->counted)
+		return;
+	resource->allocated = staged->allocated;
+	ShimCountResource(resource, 1);
+	Dx12ShimNeedResidency(staged->residency);
+	staged->counted = true;
+}
+
+static bool begin_staged_copy(ShimResource *resource)
+{
+	count_staged_resource(resource);
+	if (!Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_DEST))
+		return false;
+	resource->staged->copy_fence = Dx12ShimPendingFence();
+	return true;
+}
+
+static bool commit_staged_texture(ShimResource *resource, UINT64 budget, bool force_progress, UINT64 *recorded)
+{
+	ShimResource::Staged *staged = resource->staged;
+	D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+	bool whole_only = (resource->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) || resource->desc.SampleDesc.Count > 1;
+	bool volume = resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+	UINT block = ModLoadTextureBlockHeight(resource->desc.Format);
+
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dst.pResource = resource->resource;
+	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	src.pResource = staged->upload.buffer;
+	while (staged->next_subresource < staged->layouts.size()) {
+		UINT i = staged->next_subresource;
+		if (!staged->written[i]) {
+			staged->next_subresource++;
+			continue;
+		}
+
+		const D3D12_SUBRESOURCE_FOOTPRINT &footprint = staged->layouts[i].Footprint;
+		UINT bands = whole_only ? 1 : volume ? footprint.Depth : staged->rows[i];
+		UINT64 band_bytes = staged->row_sizes[i];
+		if (whole_only)
+			band_bytes *= (UINT64)staged->rows[i] * footprint.Depth;
+		else if (volume)
+			band_bytes *= staged->rows[i];
+
+		UINT first = staged->next_band;
+		UINT64 remaining = budget > *recorded ? budget - *recorded : 0;
+		UINT count = (UINT)std::min<UINT64>(bands - first, remaining / band_bytes);
+		if (!count) {
+			if (!force_progress || *recorded)
+				return false;
+			count = 1;
+		}
+		if (!*recorded && !begin_staged_copy(resource))
+			return false;
+
+		UINT end = first + count;
+		dst.SubresourceIndex = i;
+		src.PlacedFootprint = staged->layouts[i];
+		if (!first && end == bands) {
+			Dx12ShimList()->CopyTextureRegion(&dst, 0, 0, 0, &src, NULL);
+		} else if (volume) {
+			D3D12_BOX box = { 0, 0, first, footprint.Width, footprint.Height, end };
+			Dx12ShimList()->CopyTextureRegion(&dst, 0, 0, first, &src, &box);
+		} else {
+			D3D12_BOX box = { 0, first * block, 0, footprint.Width, min(footprint.Height, end * block), 1 };
+			Dx12ShimList()->CopyTextureRegion(&dst, 0, box.top, 0, &src, &box);
+		}
+		*recorded += count * band_bytes;
+		staged->next_band = end;
+		if (end != bands)
+			return false;
+		staged->next_band = 0;
+		staged->next_subresource++;
+	}
+	return true;
+}
+
+bool Dx12ShimCommitStaged(ID3D11Resource *resource11, UINT64 budget, bool force_progress, UINT64 *recorded)
+{
+	ShimResource *resource = ShimResourceOf(resource11);
+
+	*recorded = 0;
+	if (!resource || !resource->staged)
+		return true;
+
+	ShimResource::Staged *staged = resource->staged;
+	if (staged->upload.buffer) {
+		if (!staged->layouts.empty()) {
+			if (!commit_staged_texture(resource, budget, force_progress, recorded))
+				return false;
+		} else {
+			UINT64 offset = staged->buffer_offset;
+			UINT64 bytes = min(budget, staged->buffer_bytes - offset);
+
+			if (!bytes || !begin_staged_copy(resource))
+				return false;
+			Dx12ShimList()->CopyBufferRegion(resource->resource, offset, staged->upload.buffer, offset, bytes);
+			*recorded = bytes;
+			staged->buffer_offset += bytes;
+			if (staged->buffer_offset != staged->buffer_bytes)
+				return false;
+		}
+	}
+	count_staged_resource(resource);
+	Dx12ShimRecycleStagedUpload(staged->upload, staged->copy_fence);
+	resource->staged = nullptr;
+	delete staged;
+	return true;
+}
+
+UINT64 Dx12ShimStagedUploadBytes(ID3D11Resource *resource11)
+{
+	ShimResource *resource = ShimResourceOf(resource11);
+
+	if (!resource || !resource->staged || !resource->staged->upload.buffer)
+		return 0;
+	return resource->staged->upload.capacity;
+}
+
+static bool stage_buffer(ShimResource *resource, const void *data, UINT64 size)
+{
+	ShimResource::Staged *staged = resource->staged;
+
+	if (!Dx12ShimAcquireStagedUpload(size, &staged->upload))
+		return false;
+	staged->buffer_bytes = size;
+	{
+		Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_COPY, L"buffer bytes", size);
+		memcpy(staged->upload.cpu, data, (size_t)size);
+	}
+	return true;
+}
+
+static bool stage_texture(ShimResource *resource, const D3D11_SUBRESOURCE_DATA *initial_data, UINT subresources)
+{
+	ShimResource::Staged *staged = resource->staged;
+	UINT64 total;
+
+	staged->layouts.resize(subresources);
+	staged->rows.resize(subresources);
+	staged->row_sizes.resize(subresources);
+	staged->written.assign(subresources, false);
+	dx12_shim->device->GetCopyableFootprints(&resource->desc, 0, subresources, 0, staged->layouts.data(),
+		staged->rows.data(), staged->row_sizes.data(), &total);
+	if (total == UINT64_MAX || !Dx12ShimAcquireStagedUpload(total, &staged->upload))
+		return false;
+
+	Profiling::Spike::Scope spike(Profiling::Spike::DX12_UPLOAD_COPY, L"texture bytes", total);
+	for (UINT i = 0; i < subresources; i++) {
+		const D3D12_PLACED_SUBRESOURCE_FOOTPRINT &layout = staged->layouts[i];
+		UINT rows = staged->rows[i];
+		UINT64 row_size = staged->row_sizes[i];
+		UINT64 row_pitch = initial_data[i].SysMemPitch ? initial_data[i].SysMemPitch : row_size;
+		UINT64 slice_pitch = initial_data[i].SysMemSlicePitch ? initial_data[i].SysMemSlicePitch : row_pitch * rows;
+
+		if (!initial_data[i].pSysMem)
+			continue;
+		for (UINT z = 0; z < layout.Footprint.Depth; z++) {
+			for (UINT y = 0; y < rows; y++) {
+				memcpy(staged->upload.cpu + layout.Offset + ((SIZE_T)z * rows + y) * layout.Footprint.RowPitch,
+					(const BYTE*)initial_data[i].pSysMem + (SIZE_T)(z * slice_pitch + y * row_pitch), (size_t)row_size);
+			}
+		}
+		staged->written[i] = true;
+	}
+	return true;
+}
+
 static HRESULT create_resource(ShimResource *resource, const D3D12_RESOURCE_DESC *desc)
 {
+	UINT64 residency;
 	HRESULT hr;
 
 	{
 		Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_RESOURCE, L"bytes or texels wide", desc->Width);
-		hr = Dx12ShimCreateResource(desc, &resource->resource);
+		hr = Dx12ShimCreateResource(desc, &resource->resource, staging ? &residency : nullptr);
 	}
 	if (FAILED(hr)) {
 		Dx12LogInfo("*** Failed to create a resource for a mod: dimension %d, %llux%ux%u, %u mips, format %d, flags 0x%x = 0x%x\n",
@@ -293,6 +503,12 @@ static HRESULT create_resource(ShimResource *resource, const D3D12_RESOURCE_DESC
 
 	resource->desc = resource->resource->GetDesc();
 	resource->state = D3D12_RESOURCE_STATE_COMMON;
+	if (staging) {
+		resource->staged = new ShimResource::Staged();
+		resource->staged->allocated = dx12_shim->device->GetResourceAllocationInfo(0, 1, &resource->desc).SizeInBytes;
+		resource->staged->residency = residency;
+		return S_OK;
+	}
 	resource->allocated = dx12_shim->device->GetResourceAllocationInfo(0, 1, &resource->desc).SizeInBytes;
 	ShimCountResource(resource, 1);
 	return S_OK;
@@ -303,8 +519,7 @@ static HRESULT create_resource(ShimResource *resource, const D3D12_RESOURCE_DESC
 // three frames hold until the GPU is done with them. All of those are kept,
 // as letting go of one the lists still hold frees no memory, and a spare is
 // only let go of once no list has used it for SPARE_IDLE_MS. SPARES_MAX only
-// bounds the search for one the lists are done with, for lists that are
-// never done (stranded pins).
+// bounds the search when completion could not be recorded for some lists.
 const ULONGLONG SPARE_IDLE_MS = 1000;
 const size_t SPARES_MAX = 256;
 
@@ -373,45 +588,80 @@ void ShimForgetSpares(ShimResource *resource)
 	spare_holders.pop_back();
 }
 
+struct RenameSpike {
+	LARGE_INTEGER start = {};
+	UINT64 width;
+	bool keep_contents;
+	size_t spares_before;
+	size_t busy_spares_checked = 0;
+	bool succeeded = false;
+	bool prepared_spare = false;
+	Dx12ResourceCreationTiming creation;
+
+	RenameSpike(UINT64 width, bool keep_contents, size_t spares_before) :
+		width(width), keep_contents(keep_contents), spares_before(spares_before)
+	{
+		if (Profiling::Spike::threshold)
+			QueryPerformanceCounter(&start);
+	}
+
+	~RenameSpike()
+	{
+		if (start.QuadPart)
+			Profiling::Spike::add_dx12_rename(start.QuadPart, width, keep_contents, succeeded,
+					spares_before, busy_spares_checked, prepared_spare, creation);
+	}
+};
+
 bool ShimRenameResource(ShimResource *resource, bool keep_contents)
 {
 	static bool failed;
 	ID3D12Resource *old = resource->resource, *fresh = NULL;
 	D3D12_RESOURCE_BARRIER barrier = {};
-	size_t i;
-	Profiling::Spike::Scope spike(Profiling::Spike::DX12_RENAME, L"bytes or texels wide", resource->desc.Width);
+	RenameSpike spike(resource->desc.Width, keep_contents, resource->spares.size());
 
 	// One the lists are done with comes before a new one
-	for (i = 0; i < resource->spares.size(); i++) {
-		if (!spare_unused(resource->spares[i].resource))
-			continue;
-		fresh = resource->spares[i].resource;
-		resource->spares.erase(resource->spares.begin() + i);
+	auto unused = [](const ShimResource::Spare &spare) { return spare_unused(spare.resource); };
+	auto &spares = resource->spares;
+	auto spare = std::find_if(spares.begin(), spares.end(), unused);
+	if (spare == spares.end() && !spares.empty() && Dx12ShimReclaimRetired())
+		spare = std::find_if(spares.begin(), spares.end(), unused);
+	spike.busy_spares_checked = spare - spares.begin();
+	if (spare != spares.end()) {
+		fresh = spare->resource;
+		spares.erase(spare);
 		count_spares(resource, -1);
-		break;
 	}
-	if (!fresh && FAILED(Dx12ShimCreateResource(&resource->desc, &fresh))) {
-		if (!failed)
-			Dx12LogInfo("*** Failed to create a resource for a mod to write while the game's lists use it. The lists see the write.\n");
-		failed = true;
-		return false;
+	if (!fresh) {
+		fresh = ModLoadDx12SpareBuffer(resource->desc, resource->allocated, true);
+		if (fresh) {
+			spike.prepared_spare = true;
+			InterlockedIncrement64(&dx12_stats.prepared_spares_used);
+		}
+	}
+	if (!fresh) {
+		if (resource->dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+			InterlockedIncrement64(&dx12_stats.rename_allocations);
+		if (FAILED(Dx12ShimCreateResource(&resource->desc, &fresh, nullptr,
+				spike.start.QuadPart ? &spike.creation : nullptr))) {
+			if (!failed)
+				Dx12LogInfo("*** Failed to create a resource for a mod to write while the game's lists use it.\n");
+			failed = true;
+			return false;
+		}
 	}
 
-	// The fresh resource is in the common state, from where the copy
-	// promotes it. The old one is left in the common state as well, as
-	// the lists that use it expect.
 	if (keep_contents) {
-		Dx12ShimTransition(resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		Dx12ShimSetState(resource, D3D12_RESOURCE_STATE_COPY_SOURCE);
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Transition.pResource = fresh;
+		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+		Dx12ShimList()->ResourceBarrier(1, &barrier);
 		Dx12ShimList()->CopyResource(fresh, old);
 	}
-	if (resource->state != D3D12_RESOURCE_STATE_COMMON) {
-		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barrier.Transition.pResource = old;
-		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		barrier.Transition.StateBefore = resource->state;
-		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-		Dx12ShimList()->ResourceBarrier(1, &barrier);
-	}
+	Dx12ShimSetState(resource, D3D12_RESOURCE_STATE_COMMON);
 
 	resource->resource = fresh;
 	resource->state = keep_contents ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON;
@@ -425,6 +675,7 @@ bool ShimRenameResource(ShimResource *resource, bool keep_contents)
 	for (ShimView *view : resource->views)
 		ShimRecreateView(view);
 	InterlockedIncrement64(&dx12_stats.resources_renamed);
+	spike.succeeded = true;
 	return true;
 }
 
@@ -446,6 +697,7 @@ bool ShimBufferToGpu(ShimResource *resource)
 		return false;
 
 	resource->cpu_only = false;
+	resource->prepare_spares_on_pin = true;
 	ShimReadShadow(resource);
 	return ShimWriteBuffer(resource, 0, resource->shadow.data(), resource->shadow.size());
 }
@@ -462,9 +714,28 @@ void ShimUploadShadow(ShimResource *resource)
 	ShimWriteBuffer(resource, 0, resource->shadow.data(), min((UINT64)resource->shadow.size(), resource->desc.Width));
 }
 
-HRESULT STDMETHODCALLTYPE ShimDevice::CreateBuffer(const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Buffer **ppBuffer)
+bool Dx12ShimBufferDesc(const D3D11_BUFFER_DESC &buffer, D3D12_RESOURCE_DESC *desc)
 {
 	const UINT address_binds = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER;
+	if (buffer.Usage == D3D11_USAGE_STAGING
+			|| (buffer.BindFlags && !(buffer.BindFlags & ~address_binds)
+				&& (buffer.Usage == D3D11_USAGE_DYNAMIC || (buffer.BindFlags & D3D11_BIND_CONSTANT_BUFFER))))
+		return false;
+
+	*desc = {};
+	desc->Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	desc->Width = ShimAlign(buffer.ByteWidth, 256);
+	desc->Height = 1;
+	desc->DepthOrArraySize = 1;
+	desc->MipLevels = 1;
+	desc->SampleDesc.Count = 1;
+	desc->Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	desc->Flags = resource_flags(buffer.BindFlags & D3D11_BIND_UNORDERED_ACCESS);
+	return true;
+}
+
+HRESULT STDMETHODCALLTYPE ShimDevice::CreateBuffer(const D3D11_BUFFER_DESC *pDesc, const D3D11_SUBRESOURCE_DATA *pInitialData, ID3D11Buffer **ppBuffer)
+{
 	D3D12_RESOURCE_DESC desc = {};
 	ShimBuffer *buffer;
 	bool keep_contents;
@@ -486,20 +757,11 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateBuffer(const D3D11_BUFFER_DESC *pDes
 	r = &buffer->r;
 	r->dimension = D3D11_RESOURCE_DIMENSION_BUFFER;
 
-	if (pDesc->Usage == D3D11_USAGE_STAGING)
-		r->cpu_only = true;
-	else if (pDesc->BindFlags && !(pDesc->BindFlags & ~address_binds))
-		r->cpu_only = pDesc->Usage == D3D11_USAGE_DYNAMIC || (pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER);
+	r->cpu_only = !Dx12ShimBufferDesc(*pDesc, &desc);
 
 	if (!r->cpu_only) {
-		desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-		desc.Width = ShimAlign(pDesc->ByteWidth, 256);
-		desc.Height = 1;
-		desc.DepthOrArraySize = 1;
-		desc.MipLevels = 1;
-		desc.SampleDesc.Count = 1;
-		desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-		desc.Flags = resource_flags(pDesc->BindFlags & D3D11_BIND_UNORDERED_ACCESS);
+		r->prepare_spares_on_pin = !pInitialData || !pInitialData->pSysMem
+			|| (pDesc->BindFlags & D3D11_BIND_UNORDERED_ACCESS);
 
 		hr = create_resource(r, &desc);
 		if (FAILED(hr)) {
@@ -521,8 +783,15 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateBuffer(const D3D11_BUFFER_DESC *pDes
 			r->shadow.assign((const BYTE*)pInitialData->pSysMem, (const BYTE*)pInitialData->pSysMem + pDesc->ByteWidth);
 		r->shadow.resize((size_t)ShimAlign(pDesc->ByteWidth, 256));
 	}
-	if (!r->cpu_only && pInitialData && pInitialData->pSysMem)
-		ShimWriteBuffer(r, 0, pInitialData->pSysMem, pDesc->ByteWidth);
+	if (!r->cpu_only && pInitialData && pInitialData->pSysMem) {
+		if (r->staged) {
+			if (!stage_buffer(r, pInitialData->pSysMem, pDesc->ByteWidth)) {
+				buffer->Release();
+				return E_OUTOFMEMORY;
+			}
+		} else
+			ShimWriteBuffer(r, 0, pInitialData->pSysMem, pDesc->ByteWidth);
+	}
 	r->shadow_version = r->version;
 
 	*ppBuffer = buffer;
@@ -555,8 +824,11 @@ static HRESULT create_texture(ShimResource *r, D3D12_RESOURCE_DESC *desc, D3D11_
 	subresources = r->desc.MipLevels;
 	if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
 		subresources *= r->desc.DepthOrArraySize;
+	if (r->staged && !stage_texture(r, initial_data, subresources))
+		return E_OUTOFMEMORY;
 	for (i = 0; i < subresources; i++) {
-		if (!ShimWriteSubresource(r, i, initial_data[i].pSysMem, initial_data[i].SysMemPitch,
+		if (r->staged ? !initial_data[i].pSysMem
+		    : !ShimWriteSubresource(r, i, initial_data[i].pSysMem, initial_data[i].SysMemPitch,
 				initial_data[i].SysMemSlicePitch))
 			continue;
 		if (!i && !r->shadow.empty()) {
@@ -842,6 +1114,7 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateShaderResourceView(ID3D11Resource *p
 	view->mDesc = desc;
 	view->v.kind = ShimView::SRV;
 	view->v.desc12.srv = desc12;
+	ShimSetViewRange(&view->v);
 	ShimRecreateView(&view->v);
 
 	*ppSRView = view;
@@ -937,6 +1210,7 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateUnorderedAccessView(ID3D11Resource *
 	view->mDesc = desc;
 	view->v.kind = ShimView::UAV;
 	view->v.desc12.uav = desc12;
+	ShimSetViewRange(&view->v);
 	ShimRecreateView(&view->v);
 
 	*ppUAView = view;
@@ -986,6 +1260,14 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateRenderTargetView(ID3D11Resource *pRe
 	}
 
 	desc12.Format = desc.Format;
+	if (!pDesc || desc.Format == DXGI_FORMAT_UNKNOWN) {
+		D3D12_FEATURE_DATA_FORMAT_SUPPORT support = {resource.format};
+		if (resource.format == DXGI_FORMAT_UNKNOWN
+		    || FAILED(dx12_shim->device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support, sizeof(support)))
+		    || !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET))
+			return E_INVALIDARG;
+		desc12.Format = desc.Format = resource.format;
+	}
 	desc12.ViewDimension = (D3D12_RTV_DIMENSION)desc.ViewDimension;
 	switch (desc.ViewDimension) {
 	case D3D11_RTV_DIMENSION_BUFFER:
@@ -1029,6 +1311,7 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateRenderTargetView(ID3D11Resource *pRe
 	view->mDesc = desc;
 	view->v.kind = ShimView::RTV;
 	view->v.desc12.rtv = desc12;
+	ShimSetViewRange(&view->v);
 	ShimRecreateView(&view->v);
 
 	*ppRTView = view;
@@ -1074,6 +1357,14 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateDepthStencilView(ID3D11Resource *pRe
 	}
 
 	desc12.Format = desc.Format;
+	if (desc.Format == DXGI_FORMAT_UNKNOWN)
+		desc12.Format = desc.Format = resource.format;
+	if (desc.Format != DXGI_FORMAT_D32_FLOAT && desc.Format != DXGI_FORMAT_D16_UNORM
+	    && desc.Format != DXGI_FORMAT_D24_UNORM_S8_UINT && desc.Format != DXGI_FORMAT_D32_FLOAT_S8X24_UINT)
+		return E_INVALIDARG;
+	if ((desc.Format == DXGI_FORMAT_D32_FLOAT || desc.Format == DXGI_FORMAT_D16_UNORM)
+	    && (desc.Flags & D3D11_DSV_READ_ONLY_STENCIL))
+		return E_INVALIDARG;
 	desc12.ViewDimension = (D3D12_DSV_DIMENSION)desc.ViewDimension;
 	// D3D12_DSV_FLAGS has the values of D3D11_DSV_FLAG
 	desc12.Flags = (D3D12_DSV_FLAGS)desc.Flags;
@@ -1108,9 +1399,9 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateDepthStencilView(ID3D11Resource *pRe
 	if (FAILED(hr))
 		return hr;
 	view->mDesc = desc;
-	view->v.read_only = (desc.Flags & D3D11_DSV_READ_ONLY_DEPTH) && (desc.Flags & D3D11_DSV_READ_ONLY_STENCIL);
 	view->v.kind = ShimView::DSV;
 	view->v.desc12.dsv = desc12;
+	ShimSetViewRange(&view->v);
 	ShimRecreateView(&view->v);
 
 	*ppDepthStencilView = view;
@@ -1120,9 +1411,8 @@ HRESULT STDMETHODCALLTYPE ShimDevice::CreateDepthStencilView(ID3D11Resource *pRe
 // -----------------------------------------------------------------------------
 // Shaders
 
-// A shader stripped of its reflection data, as the ones DirectXTK draws the
-// overlay with are, still declares what it reads in its code. Shader model 4
-// and 5.0 only, where a register is its own binding.
+// DXBC declarations supply buffer strides even when reflection is stripped.
+// Shader model 4 and 5.0 only, where a register is its own binding.
 static void reflect_declarations(ShimShader *shader)
 {
 	static const BYTE dimensions[] = {
@@ -1196,16 +1486,18 @@ static void reflect_declarations(ShimShader *shader)
 			dimension = token >> 11 & 0x1f;
 			if (reg < SHIM_SRV_SLOTS && dimension && dimension < ARRAYSIZE(dimensions)) {
 				shader->srv_used[reg / 64] |= 1ull << (reg % 64);
-				shader->srv_count = max(shader->srv_count, reg + 1);
 				shader->srv_dimension[reg] = dimensions[dimension];
+				if (dimension == 1 && operand + 2 < code + length)
+					shader->srv_buffer[reg] = Dx12BufferBinding(D3D_SIT_TEXTURE, (D3D_RESOURCE_RETURN_TYPE)(operand[2] & 15), 0);
 			}
 			break;
 		case DCL_RESOURCE_RAW:
 		case DCL_RESOURCE_STRUCTURED:
 			if (reg < SHIM_SRV_SLOTS) {
 				shader->srv_used[reg / 64] |= 1ull << (reg % 64);
-				shader->srv_count = max(shader->srv_count, reg + 1);
 				shader->srv_dimension[reg] = D3D12_SRV_DIMENSION_BUFFER;
+				shader->srv_buffer[reg] = opcode == DCL_RESOURCE_RAW ? (UINT16)DX12_BUFFER_RAW
+					: Dx12BufferBinding(D3D_SIT_STRUCTURED, D3D_RETURN_TYPE_MIXED, operand + 2 < code + length ? operand[2] : 0);
 			}
 			break;
 		case DCL_UAV_TYPED:
@@ -1223,6 +1515,15 @@ static void reflect_declarations(ShimShader *shader)
 			case 5: shader->uav_dimension[reg] = D3D12_UAV_DIMENSION_TEXTURE3D; break;
 			case 7: shader->uav_dimension[reg] = D3D12_UAV_DIMENSION_TEXTURE1DARRAY; break;
 			case 8: shader->uav_dimension[reg] = D3D12_UAV_DIMENSION_TEXTURE2DARRAY; break;
+			}
+			if (shader->uav_dimension[reg] == D3D12_UAV_DIMENSION_BUFFER) {
+				UINT extra = operand + 2 < code + length ? operand[2] : 0;
+				if (opcode == DCL_UAV_RAW)
+					shader->uav_buffer[reg] = DX12_BUFFER_RAW;
+				else if (opcode == DCL_UAV_STRUCTURED)
+					shader->uav_buffer[reg] = Dx12BufferBinding(D3D_SIT_UAV_RWSTRUCTURED, D3D_RETURN_TYPE_MIXED, extra);
+				else
+					shader->uav_buffer[reg] = Dx12BufferBinding(D3D_SIT_UAV_RWTYPED, (D3D_RESOURCE_RETURN_TYPE)(extra & 15), 0);
 			}
 			break;
 		}
@@ -1250,14 +1551,36 @@ static bool reflect_bindings(Reflection *reflection, ShimShader *shader)
 		}
 	}
 
-	if (!desc.BoundResources && !shader->dxil)
-		reflect_declarations(shader);
-
 	for (i = 0; i < desc.BoundResources; i++) {
 		if (FAILED(reflection->GetResourceBindingDesc(i, &bind)))
 			continue;
 
-		for (reg = bind.BindPoint; reg < bind.BindPoint + (bind.BindCount ? bind.BindCount : 1); reg++) {
+		if (bind.Type == D3D_SIT_TBUFFER || bind.Type == D3D_SIT_TEXTURE || bind.Type == D3D_SIT_STRUCTURED
+		    || bind.Type == D3D_SIT_BYTEADDRESS || bind.Type == D3D_SIT_RTACCELERATIONSTRUCTURE) {
+			shader->uses_acceleration_structure |= bind.Type == D3D_SIT_RTACCELERATIONSTRUCTURE;
+			if (!bind.BindCount || bind.BindPoint >= SHIM_SRV_SLOTS || bind.BindCount > SHIM_SRV_SLOTS - bind.BindPoint) {
+				shader->unsupported_srv_range = true;
+				Dx12LogInfo("*** Unsupported SRV range in mod %s shader: %s at t%u, count %u (limit: %u slots)\n",
+					dx12_stage_names[shader->stage], bind.Name ? bind.Name : "(unnamed)",
+					bind.BindPoint, bind.BindCount, SHIM_SRV_SLOTS);
+			}
+			for (reg = bind.BindPoint; reg < SHIM_SRV_SLOTS && reg - bind.BindPoint < max(1u, bind.BindCount); reg++) {
+				shader->srv_used[reg / 64] |= 1ull << (reg % 64);
+				shader->srv_dimension[reg] = D3D12_SRV_DIMENSION_BUFFER;
+				if (bind.Type == D3D_SIT_RTACCELERATIONSTRUCTURE)
+					shader->srv_dimension[reg] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+				else if (bind.Type == D3D_SIT_TEXTURE && bind.Dimension != D3D_SRV_DIMENSION_BUFFEREX)
+					shader->srv_dimension[reg] = (BYTE)bind.Dimension;
+				if (shader->srv_dimension[reg] == D3D12_SRV_DIMENSION_BUFFER) {
+					UINT16 binding = Dx12BufferBinding(bind.Type, bind.ReturnType, bind.NumSamples);
+					if (binding)
+						shader->srv_buffer[reg] = binding;
+				}
+			}
+			continue;
+		}
+
+		for (reg = bind.BindPoint; reg < SHIM_SRV_SLOTS && reg - bind.BindPoint < max(1u, bind.BindCount); reg++) {
 			switch (bind.Type) {
 			case D3D_SIT_CBUFFER:
 				if (reg < SHIM_CBV_SLOTS) {
@@ -1269,18 +1592,6 @@ static bool reflect_bindings(Reflection *reflection, ShimShader *shader)
 				if (reg < SHIM_SAMPLER_SLOTS) {
 					shader->sampler_used |= 1u << reg;
 					shader->sampler_count = max(shader->sampler_count, reg + 1);
-				}
-				break;
-			case D3D_SIT_TBUFFER:
-			case D3D_SIT_TEXTURE:
-			case D3D_SIT_STRUCTURED:
-			case D3D_SIT_BYTEADDRESS:
-				if (reg < SHIM_SRV_SLOTS) {
-					shader->srv_used[reg / 64] |= 1ull << (reg % 64);
-					shader->srv_count = max(shader->srv_count, reg + 1);
-					shader->srv_dimension[reg] = D3D12_SRV_DIMENSION_BUFFER;
-					if (bind.Type == D3D_SIT_TEXTURE && bind.Dimension != D3D_SRV_DIMENSION_BUFFEREX)
-						shader->srv_dimension[reg] = (BYTE)bind.Dimension;
 				}
 				break;
 			case D3D_SIT_UAV_RWTYPED:
@@ -1310,6 +1621,11 @@ static bool reflect_bindings(Reflection *reflection, ShimShader *shader)
 						shader->uav_dimension[reg] = D3D12_UAV_DIMENSION_TEXTURE3D;
 						break;
 					}
+					if (shader->uav_dimension[reg] == D3D12_UAV_DIMENSION_BUFFER) {
+						UINT16 binding = Dx12BufferBinding(bind.Type, bind.ReturnType, bind.NumSamples);
+						if (binding)
+							shader->uav_buffer[reg] = binding;
+					}
 				}
 				break;
 			}
@@ -1326,6 +1642,8 @@ static void reflect_shader(ShimShader *shader)
 	bool read = false;
 
 	shader->dxil = Dx12BytecodeIsDxil(shader->bytecode.data(), shader->bytecode.size());
+	if (!shader->dxil)
+		reflect_declarations(shader);
 	if (shader->dxil) {
 		if (Dx12DxcReflect(shader->bytecode.data(), shader->bytecode.size(), &reflection12)) {
 			read = reflect_bindings<ID3D12ShaderReflection, D3D12_SHADER_DESC, D3D12_SHADER_INPUT_BIND_DESC,
@@ -1340,6 +1658,10 @@ static void reflect_shader(ShimShader *shader)
 	if (!read) {
 		Dx12LogInfo("*** No reflection for a %s %s shader of a mod, it will be given no resources\n",
 			shader->dxil ? "DXIL" : "DXBC", dx12_stage_names[shader->stage]);
+	}
+	for (UINT64 slots : shader->srv_used) {
+		for (; slots; slots &= slots - 1)
+			shader->srv_count++;
 	}
 }
 

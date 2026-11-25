@@ -3,6 +3,8 @@
 #include <wrl.h>
 #include <string>
 
+struct Dx12ResourceCreationTiming;
+
 namespace Profiling {
 	enum class Mode {
 		NONE = 0,
@@ -39,6 +41,8 @@ namespace Profiling {
 		overhead->cpu.QuadPart += end_time.QuadPart - state->start_time.QuadPart;
 	}
 
+	extern Mode mode;
+
 	template<class T>
 	static inline typename T::iterator lookup_map(T &map, typename T::key_type key, Profiling::Overhead *overhead)
 	{
@@ -51,7 +55,7 @@ namespace Profiling {
 		auto ret = map.find(key);
 		if (Profiling::mode == Profiling::Mode::SUMMARY) {
 			Profiling::end(&state, overhead);
-			if (ret != end(map))
+			if (ret != map.end())
 				overhead->hits++;
 		}
 		return ret;
@@ -61,7 +65,6 @@ namespace Profiling {
 	void update_cto_warning(bool warn);
 	void clear();
 
-	extern Mode mode;
 	extern Overhead present_overhead;
 	extern Overhead overlay_overhead;
 	extern Overhead draw_overhead;
@@ -134,6 +137,10 @@ namespace Profiling {
 			DX12_UPLOAD_HASH_COPY,
 			// Nested inside the above (or inside each other):
 			RESOURCE_LOAD,
+			MOD_UPLOAD_AT_PRESENT,
+			MOD_RESOURCE_AT_PRESENT,
+			MOD_RESOURCE_ON_USE,
+			MOD_SHADER_ON_USE,
 			SHADER_CREATE_DRIVER,
 			SHADER_REGEX,
 			SHADER_REGEX_CACHE,
@@ -159,6 +166,7 @@ namespace Profiling {
 			DX12_UPLOAD_HASH_FINISH,
 			DX12_UPLOAD_HASH_RING,
 			VK_DRAW,
+			VK_MOD_PIPELINE,
 			VK_TEXTURE_IMAGE,
 			VK_TEXTURE_COPY,
 			VK_MEMORY,
@@ -219,6 +227,11 @@ namespace Profiling {
 		// the recent average, whichever is given
 		void init(float threshold_ms, float relative, bool detail, const wchar_t *log_dir);
 		void add(Category category, INT64 start, const wchar_t *name, UINT64 id, UINT64 bytes = 0);
+		void add_dx12_rename(INT64 start, UINT64 width, bool keep_contents, bool succeeded,
+				size_t spares_before, size_t busy_spares_checked, bool prepared_spare,
+				const Dx12ResourceCreationTiming &creation);
+		void note_dx12_spare(const wchar_t *event, UINT64 id, UINT64 width, UINT flags,
+				const wchar_t *status, const wchar_t *mod = nullptr);
 		void frame(bool mods_disabled = false);
 		void configure_mod_state(const wchar_t *variable);
 		void sample_mod_state();
@@ -235,6 +248,27 @@ namespace Profiling {
 			reason_names[index] = name;
 			InterlockedIncrement(&reason_counts[index]);
 		}
+
+		extern thread_local const wchar_t *command_line;
+
+		class CommandScope {
+			const wchar_t *previous = nullptr;
+			bool active;
+		public:
+			CommandScope(bool enabled, const wchar_t *line) : active(enabled && *line)
+			{
+				if (active) {
+					previous = command_line;
+					command_line = line;
+				}
+			}
+
+			~CommandScope()
+			{
+				if (active)
+					command_line = previous;
+			}
+		};
 
 		class Scope {
 			LARGE_INTEGER start;

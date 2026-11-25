@@ -208,10 +208,22 @@ static bool reflect_psv0(Blob psv, Dx12ShaderInfo *info)
 			} else {
 				info->unmasked |= upper >= 128;
 				mark_registers(info->srv, 2, lower, upper - lower + 1);
+				if (type == 4 || type == 5) {
+					for (UINT slot = lower; slot < 128 && slot <= upper; slot++) {
+						info->srv_dimension[slot] = D3D12_SRV_DIMENSION_BUFFER;
+						info->srv_buffer[slot] = type == 4 ? DX12_BUFFER_RAW : 0;
+					}
+				}
 			}
 		} else {
 			info->unmasked |= upper >= 64;
 			mark_registers(&info->uav, 1, lower, upper == UINT_MAX ? 64 : upper - lower + 1);
+			if (type >= 7) {
+				for (UINT slot = lower; slot < 64 && slot <= upper; slot++) {
+					info->uav_dimension[slot] = D3D12_UAV_DIMENSION_BUFFER;
+					info->uav_buffer[slot] = type == 7 ? DX12_BUFFER_RAW : 0;
+				}
+			}
 		}
 	}
 
@@ -223,6 +235,29 @@ static bool reflect_psv0(Blob psv, Dx12ShaderInfo *info)
 // version at 16. A binding is name, type, return type, dimension, samples,
 // bind point, bind count and flags, each a u32, plus space and id for shader
 // model 5.1.
+UINT16 Dx12BufferBinding(D3D_SHADER_INPUT_TYPE type, D3D_RESOURCE_RETURN_TYPE component, UINT stride)
+{
+	switch (type) {
+	case D3D_SIT_BYTEADDRESS:
+	case D3D_SIT_UAV_RWBYTEADDRESS:
+		return DX12_BUFFER_RAW;
+	case D3D_SIT_STRUCTURED:
+	case D3D_SIT_UAV_RWSTRUCTURED:
+	case D3D_SIT_UAV_APPEND_STRUCTURED:
+	case D3D_SIT_UAV_CONSUME_STRUCTURED:
+	case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER:
+		return stride && !(stride % 4) && stride <= D3D12_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES ? (UINT16)stride : 0;
+	default:
+		switch (component) {
+		case D3D_RETURN_TYPE_SINT: return DX12_BUFFER_SINT;
+		case D3D_RETURN_TYPE_FLOAT:
+		case D3D_RETURN_TYPE_UNORM:
+		case D3D_RETURN_TYPE_SNORM: return DX12_BUFFER_FLOAT;
+		default: return DX12_BUFFER_UINT;
+		}
+	}
+}
+
 static bool reflect_rdef(Blob rdef, Dx12ShaderInfo *info)
 {
 	UINT32 count, offset, version, type, reg, reg_count, space, i;
@@ -236,7 +271,10 @@ static bool reflect_rdef(Blob rdef, Dx12ShaderInfo *info)
 	record_size = (version & 0xffff) == 0x0501 ? 40 : 32;
 
 	for (i = 0, pos = offset; i < count; i++, pos += record_size) {
-		if (!read32(rdef, pos + 4, &type) || !read32(rdef, pos + 20, &reg) || !read32(rdef, pos + 24, &reg_count))
+		UINT32 component, dimension, stride;
+		if (!read32(rdef, pos + 4, &type) || !read32(rdef, pos + 8, &component)
+		    || !read32(rdef, pos + 12, &dimension) || !read32(rdef, pos + 16, &stride)
+		    || !read32(rdef, pos + 20, &reg) || !read32(rdef, pos + 24, &reg_count))
 			return false;
 		space = 0;
 		if (record_size == 40 && !read32(rdef, pos + 32, &space))
@@ -285,6 +323,13 @@ static bool reflect_rdef(Blob rdef, Dx12ShaderInfo *info)
 				} else {
 					info->unmasked |= (UINT64)reg + reg_count > 128;
 					mark_registers(info->srv, 2, reg, reg_count);
+					BYTE view_dimension = type == D3D_SIT_TEXTURE && dimension != D3D_SRV_DIMENSION_BUFFEREX
+						? (BYTE)dimension : (BYTE)D3D12_SRV_DIMENSION_BUFFER;
+					for (UINT slot = reg; slot < 128 && slot - reg < reg_count; slot++) {
+						info->srv_dimension[slot] = view_dimension;
+						if (view_dimension == D3D12_SRV_DIMENSION_BUFFER)
+							info->srv_buffer[slot] = Dx12BufferBinding((D3D_SHADER_INPUT_TYPE)type, (D3D_RESOURCE_RETURN_TYPE)component, stride);
+					}
 				}
 				break;
 			case D3D_SIT_UAV_RWTYPED:
@@ -295,6 +340,12 @@ static bool reflect_rdef(Blob rdef, Dx12ShaderInfo *info)
 			case D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER:
 				info->unmasked |= !reg_count || (UINT64)reg + reg_count > 64;
 				mark_registers(&info->uav, 1, reg, reg_count ? reg_count : 64);
+				if (type != D3D_SIT_UAV_RWTYPED || dimension == D3D_SRV_DIMENSION_BUFFER) {
+					for (UINT slot = reg; slot < 64 && slot - reg < reg_count; slot++) {
+						info->uav_dimension[slot] = D3D12_UAV_DIMENSION_BUFFER;
+						info->uav_buffer[slot] = Dx12BufferBinding((D3D_SHADER_INPUT_TYPE)type, (D3D_RESOURCE_RETURN_TYPE)component, stride);
+					}
+				}
 				break;
 			case D3D_SIT_SAMPLER:
 				break;
@@ -313,8 +364,31 @@ bool Dx12ReflectShaderResources(const void *bytecode, size_t size, Dx12ShaderInf
 
 	if (!bytecode || !size || !info)
 		return false;
-	if (find_part(container, "PSV0", &part))
-		return info->reflected = reflect_psv0(part, info);
+	if (find_part(container, "PSV0", &part)) {
+		info->reflected = reflect_psv0(part, info);
+		Dx12DxilResources resources;
+		if (find_part(container, "DXIL", &part) && Dx12ReadDxilResources({ part.data, part.size }, &resources)) {
+			for (const auto &cbuffer : resources.cbuffers) {
+				if (!cbuffer.space && cbuffer.reg < DX12_CB_SIZES)
+					info->cb_bytes[cbuffer.reg] = cbuffer.bytes;
+			}
+			for (const auto &buffer : resources.structured) {
+				if (buffer.space)
+					continue;
+				UINT16 stride = Dx12BufferBinding(D3D_SIT_STRUCTURED, D3D_RETURN_TYPE_MIXED, buffer.stride);
+				if (!stride)
+					continue;
+				UINT limit = buffer.uav ? ARRAYSIZE(info->uav_buffer) : ARRAYSIZE(info->srv_buffer);
+				auto *dimensions = buffer.uav ? info->uav_dimension : info->srv_dimension;
+				auto *bindings = buffer.uav ? info->uav_buffer : info->srv_buffer;
+				for (UINT slot = buffer.reg; slot < limit && slot - buffer.reg < buffer.count; slot++) {
+					dimensions[slot] = buffer.uav ? (BYTE)D3D12_UAV_DIMENSION_BUFFER : (BYTE)D3D12_SRV_DIMENSION_BUFFER;
+					bindings[slot] = stride;
+				}
+			}
+		}
+		return info->reflected;
+	}
 	if (find_part(container, "RDEF", &part))
 		return info->reflected = reflect_rdef(part, info);
 	return false;
@@ -323,7 +397,6 @@ bool Dx12ReflectShaderResources(const void *bytecode, size_t size, Dx12ShaderInf
 static const Dx12ShaderInfo* shader_info(Dx12ShaderStage stage, const D3D12_SHADER_BYTECODE *bytecode)
 {
 	Dx12ShaderInfo *info, *existing = NULL;
-	std::vector<Dx12DxilCBuffer> cbuffers;
 	Blob container, part;
 	BYTE *copy = NULL;
 	UINT64 hash;
@@ -351,12 +424,6 @@ static const Dx12ShaderInfo* shader_info(Dx12ShaderStage stage, const D3D12_SHAD
 	container.data = (const BYTE*)bytecode->pShaderBytecode;
 	container.size = bytecode->BytecodeLength;
 	info->dxil = find_part(container, "DXIL", &part);
-	if (info->dxil && Dx12ReadDxilCBuffers(part.data, part.size, &cbuffers)) {
-		for (const Dx12DxilCBuffer &cbuffer : cbuffers) {
-			if (!cbuffer.space && cbuffer.reg < DX12_CB_SIZES)
-				info->cb_bytes[cbuffer.reg] = cbuffer.bytes;
-		}
-	}
 	if (stage == DX12_STAGE_VS) {
 		std::vector<Dx12SignatureElement> inputs;
 		if (Dx12ReadSignature(bytecode->pShaderBytecode, bytecode->BytecodeLength, false, &inputs)) {
@@ -1001,9 +1068,15 @@ static void patch_depth_stencil_state(D3D12_DEPTH_STENCIL_DESC2 *dst, const D3D1
 	dst->BackFace.StencilWriteMask = src.StencilWriteMask;
 }
 
-// Where the value is in the subobjects that have a pointer in them, which are
-// the only ones looked into
+// Where the value is in the subobjects that have a pointer in them. Values
+// aligned to less than a pointer come right after the type (stream_value).
 const size_t STREAM_VALUE = offsetof(StreamSubobject<void*>, value);
+
+template <class T>
+static T* stream_value(BYTE *subobject)
+{
+	return &reinterpret_cast<StreamSubobject<T>*>(subobject)->value;
+}
 
 // 0 for a subobject this code does not know
 static size_t subobject_size(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type)
@@ -1237,12 +1310,15 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		bool blend_patched = false, sample_mask_patched = false, depth_stencil_patched = false;
 
 		for (pos = 0; !failed && pos < creation.size(); pos += size) {
-			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)(creation.data() + pos);
-			BYTE *value = creation.data() + pos + STREAM_VALUE;
+			BYTE *subobject = creation.data() + pos;
+			D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = *(const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE*)subobject;
+			BYTE *value = subobject + STREAM_VALUE;
 
 			stage = subobject_stage(type);
 			size = subobject_size(type);
-			if (stage != DX12_STAGE_COUNT) {
+			if (!size) {
+				failed = "the game's pipeline state stream has a subobject this code does not know";
+			} else if (stage != DX12_STAGE_COUNT) {
 				if (!revive_shader((D3D12_SHADER_BYTECODE*)value, shaders[stage], !!(mod_stages & 1u << stage),
 						!!(variant->removed_stages & 1u << stage)))
 					failed = "the game's shaders were not kept";
@@ -1255,22 +1331,22 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 					*(ID3D12RootSignature**)value = variant->root_signature;
 				has_signature = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND && variant->blend_override) {
-				*(D3D12_BLEND_DESC*)value = variant->blend;
+				*stream_value<D3D12_BLEND_DESC>(subobject) = variant->blend;
 				blend_patched = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK && variant->sample_mask_override) {
-				*(UINT*)value = variant->sample_mask;
+				*stream_value<UINT>(subobject) = variant->sample_mask;
 				sample_mask_patched = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL && variant->depth_stencil_override) {
-				*(D3D12_DEPTH_STENCIL_DESC*)value = variant->depth_stencil;
+				*stream_value<D3D12_DEPTH_STENCIL_DESC>(subobject) = variant->depth_stencil;
 				depth_stencil_patched = true;
 			} else if ((type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
 			        || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2) && variant->depth_stencil_override) {
 				// These versions add fields D3D11 has no equivalent for. Keep those
 				// game-specific fields and replace only the state D3D11 exposes.
 				if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1)
-					patch_depth_stencil_state((D3D12_DEPTH_STENCIL_DESC1*)value, variant->depth_stencil);
+					patch_depth_stencil_state(stream_value<D3D12_DEPTH_STENCIL_DESC1>(subobject), variant->depth_stencil);
 				else
-					patch_depth_stencil_state((D3D12_DEPTH_STENCIL_DESC2*)value, variant->depth_stencil);
+					patch_depth_stencil_state(stream_value<D3D12_DEPTH_STENCIL_DESC2>(subobject), variant->depth_stencil);
 				depth_stencil_patched = true;
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO) {
 				*(D3D12_CACHED_PIPELINE_STATE*)value = {};

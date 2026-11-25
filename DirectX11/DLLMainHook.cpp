@@ -8,6 +8,7 @@
 #include "dx12/Dx12Hooks.h"
 #include "vk/VkHooks.h"
 #include "desktop/Channel.h"
+#include "ReShadeRuntime.hpp"
 
 HINSTANCE migoto_handle;
 
@@ -47,7 +48,7 @@ bool bLog = false;
 // We cannot log to our normal file, because this is too early, in DLLMain.
 // Nektra provides a safe log though, so we will use this when debugging.
 
-static void LogHooking(char *fmt, ...)
+static void LogHooking(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -60,7 +61,7 @@ static void LogHooking(char *fmt, ...)
 
 
 // ----------------------------------------------------------------------------
-static HRESULT InstallHookDLLMain(LPCWSTR moduleName, char *func, void **trampoline, void *hook)
+static HRESULT InstallHookDLLMain(LPCWSTR moduleName, const char *func, void **trampoline, void *hook)
 {
 	HINSTANCE module;
 	SIZE_T hook_id;
@@ -348,6 +349,8 @@ BOOL WINAPI DllMain(
 			// so bail early if this is not the intended target
 			if (!verify_intended_target(hinstDLL))
 				return false;
+
+			InitializeHooking(hinstDLL);
 
 			// Hook d3d11.dll if we are loaded via injection either
 			// under a different name, or just not as the primary

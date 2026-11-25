@@ -27,7 +27,9 @@
 #include "shader.h"
 #include "DecompileHLSL.h"
 #include "HackerContext.h"
+#include "BindingProxy.h"
 #include "HackerDXGI.h"
+#include "ModLoading.h"
 
 #include "D3D11Wrapper.h"
 #include "SpriteFont.h"
@@ -334,7 +336,7 @@ void HackerDevice::CreatePinkHuntingResources()
 	// Only create special pink mode PixelShader when requested.
 	if (G->hunting && (G->marking_mode == MarkingMode::PINK || G->config_reloadable))
 	{
-		char* hlsl =
+		const char* hlsl =
 			"float4 pshader() : SV_Target0"
 			"{"
 			"	return float4(1,0,1,1);"
@@ -435,6 +437,34 @@ HackerContext* HackerDevice::GetHackerContext()
 {
 	LogInfo("HackerDevice::GetHackerContext returns %p\n", mHackerContext);
 	return mHackerContext;
+}
+
+IUnknown* HackerDevice::GetBindingProxy()
+{
+	if (!mBindingProxy) {
+		IUnknown *proxy = MakeDeviceBindingProxy(mRealOrigDevice1, this);
+		if (proxy && InterlockedCompareExchangePointer((void**)&mBindingProxy, proxy, NULL))
+			FreeBindingProxy(proxy);
+	}
+	return mBindingProxy;
+}
+
+IUnknown* ImmediateContextBindingProxy(HackerDevice *device)
+{
+	HackerContext *context = device->mHackerContext;
+	return context ? context->GetBindingProxy() : NULL;
+}
+
+IUnknown* DeviceBindingProxyOf(HackerContext *context)
+{
+	// With device hooks the device DirectX gives back leads to HackerDevice:
+	if (G->enable_hooks & EnableHooks::DEVICE)
+		return NULL;
+	HackerDevice *device = context->GetHackerDevice();
+	IUnknown *proxy = device ? device->GetBindingProxy() : NULL;
+	if (!proxy)
+		NoteUnwrappedContext("the device of an ID3D11DeviceContext2 or later");
+	return proxy;
 }
 
 void HackerDevice::SetHackerSwapChain(HackerSwapChain *pHackerSwapChain)
@@ -889,7 +919,7 @@ static bool ReplaceASMShader(__in UINT64 hash, const wchar_t *pShaderType, const
 			std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> utf8_to_utf16;
 			pHeaderLine = utf8_to_utf16.from_bytes(asmTextBytes.data(), strchr(asmTextBytes.data(), '\n'));
 
-			vector<byte> byteCode(pBytecodeLength);
+			vector<BYTE> byteCode(pBytecodeLength);
 			memcpy(byteCode.data(), pShaderBytecode, pBytecodeLength);
 
 			// Re-assemble the ASM text back to binary
@@ -1304,7 +1334,7 @@ template <class ID3D11Shader,
 HRESULT HackerDevice::ReplaceShaderFromShaderFixes(UINT64 hash,
 		const void *pShaderBytecode, SIZE_T BytecodeLength,
 		ID3D11ClassLinkage *pClassLinkage, ID3D11Shader **ppShader,
-		wchar_t *shaderType)
+		const wchar_t *shaderType)
 {
 	ShaderOverrideMap::iterator override;
 	const char *overrideShaderModel = NULL;
@@ -1388,7 +1418,7 @@ template <class ID3D11Shader,
 HRESULT HackerDevice::ProcessShaderNotFoundInShaderFixes(UINT64 hash,
 		const void *pShaderBytecode, SIZE_T BytecodeLength,
 		ID3D11ClassLinkage *pClassLinkage, ID3D11Shader **ppShader,
-		wchar_t *shaderType)
+		const wchar_t *shaderType)
 {
 	HRESULT hr;
 
@@ -1529,7 +1559,7 @@ template <class ID3D11Shader,
 			 __in_opt ID3D11ClassLinkage *pClassLinkage,
 			 __out_opt ID3D11Shader **ppShader)
 	 >
-void HackerDevice::KeepOriginalShader(UINT64 hash, wchar_t *shaderType,
+void HackerDevice::KeepOriginalShader(UINT64 hash, const wchar_t *shaderType,
 		ID3D11Shader *pShader,
 		const void *pShaderBytecode,
 		SIZE_T BytecodeLength,
@@ -1595,6 +1625,7 @@ STDMETHODIMP_(ULONG) HackerDevice::Release(THIS)
 			mIniTexture = 0;
 			LogInfo("  releasing iniparams texture, result = %d\n", result);
 		}
+		FreeBindingProxy(mBindingProxy);
 		delete this;
 		return 0L;
 	}
@@ -1647,6 +1678,17 @@ HRESULT STDMETHODCALLTYPE HackerDevice::QueryInterface(
 	{
 		LogDebug("  failed result = %x for %p\n", hr, ppvObject);
 		return hr;
+	}
+	if (IsBindingProxyInterface(riid, false)) {
+		// With device hooks the game gets DirectX's device in any case.
+		// The reference the call took is the stand-in's:
+		IUnknown *proxy = G->enable_hooks & EnableHooks::DEVICE ? NULL : GetBindingProxy();
+		if (proxy) {
+			*ppvObject = proxy;
+			LogDebug("  return binding stand-in %p of %p\n", proxy, mRealOrigDevice1);
+			return hr;
+		}
+		NoteUnwrappedContext(NameFromIID(riid).c_str());
 	}
 
 	// No need for further checks of null ppvObject, as it could not have successfully
@@ -2275,6 +2317,8 @@ STDMETHODIMP HackerDevice::CreateBuffer(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	if (ppBuffer && pNewDesc && pNewDesc->ByteWidth >= MOD_LOAD_HEAVY_BYTES)
+		ModLoadNoteGameCreation();
 	HRESULT hr = mOrigDevice1->CreateBuffer(pNewDesc, pInitialData, ppBuffer);
 
 	if (hr == S_OK && ppBuffer && *ppBuffer)
@@ -2325,6 +2369,8 @@ STDMETHODIMP HackerDevice::CreateTexture1D(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	if (ppTexture1D && pNewDesc && ModLoadIsHeavyTexture(pNewDesc->Width, 1, pNewDesc->ArraySize))
+		ModLoadNoteGameCreation();
 	HRESULT hr = mOrigDevice1->CreateTexture1D(pNewDesc, pInitialData, ppTexture1D);
 
 	if (hr == S_OK && ppTexture1D && *ppTexture1D)
@@ -2427,6 +2473,8 @@ STDMETHODIMP HackerDevice::CreateTexture2D(THIS_
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
 	// Actual creation:
+	if (ppTexture2D && pNewDesc && ModLoadIsHeavyTexture(pNewDesc->Width, pNewDesc->Height, pNewDesc->ArraySize))
+		ModLoadNoteGameCreation();
 	HRESULT hr = mOrigDevice1->CreateTexture2D(pNewDesc, pInitialData, ppTexture2D);
 
 	if (ppTexture2D) LogDebug("  returns result = %x, handle = %p\n", hr, *ppTexture2D);
@@ -2498,6 +2546,8 @@ STDMETHODIMP HackerDevice::CreateTexture3D(THIS_
 	// Override custom settings?
 	pNewDesc = process_texture_override(hash, pDesc, &newDesc);
 
+	if (ppTexture3D && pNewDesc && ModLoadIsHeavyTexture(pNewDesc->Width, pNewDesc->Height, pNewDesc->Depth))
+		ModLoadNoteGameCreation();
 	HRESULT hr = mOrigDevice1->CreateTexture3D(pNewDesc, pInitialData, ppTexture3D);
 
 	// Register texture.
@@ -2574,7 +2624,7 @@ STDMETHODIMP HackerDevice::CreateShaderResourceView(THIS_
 // otherwise identical shaders. However I don't think there is much advantage
 // of that over just hashing the full shader, and in some cases we might like
 // to ignore variable name changes, so it seems best to skip it.
-static char* hash_whitelisted_sections[] = {
+static const char* const hash_whitelisted_sections[] = {
 	"SHDR", "SHEX",         // Bytecode
 	"ISGN",         "ISG1", // Input signature
 	"PCSG",         "PSG1", // Patch constant signature
@@ -2702,7 +2752,7 @@ STDMETHODIMP HackerDevice::CreateShader(THIS_
 	__in_opt  ID3D11ClassLinkage *pClassLinkage,
 	/* [annotation] */
 	__out_opt  ID3D11Shader **ppShader,
-	wchar_t *shaderType)
+	const wchar_t *shaderType)
 {
 	HRESULT hr;
 	UINT64 hash;

@@ -489,7 +489,7 @@ struct ResourceHandleInfo
 	// A cache whose data is read from where the resource has it only when
 	// it is asked for, a page at a time. read is given the offset in the
 	// data and has to fill all it is asked for.
-	void SetLazyDataCache(size_t size, std::function<void(uint8_t *dst, size_t offset, size_t size)> read);
+	void SetLazyDataCache(size_t size, std::move_only_function<void(uint8_t *dst, size_t offset, size_t size)> read);
 
 	void CacheRegionHash(const RegionHashKeyL2& key, uint32_t hash);
 	uint32_t GetCachedRegionHash(const RegionHashKeyL2& key);
@@ -760,7 +760,7 @@ static void LogDebugViewDesc(DescType *desc)
 // -----------------------------------------------------------------------------------------------
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476202(v=vs.85).aspx
-static wchar_t *ResourceDimensions[] = {
+static const wchar_t *const ResourceDimensions[] = {
 	L"UNKNOWN",
 	L"BUFFER",
 	L"TEXTURE1D",
@@ -769,13 +769,13 @@ static wchar_t *ResourceDimensions[] = {
 };
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ff476259(v=vs.85).aspx
-static wchar_t *ResourceUsage[] = {
+static const wchar_t *const ResourceUsage[] = {
 	L"DEFAULT",
 	L"IMMUTABLE",
 	L"DYNAMIC",
 	L"STAGING"
 };
-static wchar_t *TexResourceUsage(UINT usage)
+static const wchar_t *TexResourceUsage(UINT usage)
 {
 	if (usage < sizeof(ResourceUsage) / sizeof(ResourceUsage[0]))
 		return ResourceUsage[usage];
@@ -1017,9 +1017,13 @@ void InvalidateTextureOverrideCandidates();
 // could start matching a TextureOverride (handle info registered at its
 // address, hash changed), see texture_override_miss_cache.
 void ForgetTextureOverrideMiss(ID3D11Resource* resource);
+// Whether the resource is known to match no TextureOverride, from the cache
+// of misses alone:
+bool TextureOverrideResourceKnownMiss(ID3D11Resource* resource);
 // Whether the resource of the view is known to match no TextureOverride, as
 // far as can be told without asking the view for it. The caller holds a
-// reference to the view, for both:
+// reference to the view, for both, except that HackerContext::mGameSrvs looks
+// up views it holds none for: one destroyed since is no longer bound either.
 bool TextureOverrideViewKnownMiss(ID3D11View* view);
 void NoteTextureOverrideViewResource(ID3D11View* view, ID3D11Resource* resource);
 // Whether no TextureOverride section can match the resource, whatever the draw

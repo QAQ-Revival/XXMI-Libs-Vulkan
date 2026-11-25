@@ -63,6 +63,7 @@ struct ShimState {
 };
 
 bool Dx12ShimPipelineInit();
+bool Dx12ShimSupportsShaderBindings(const ShimShader *shader);
 
 // Record everything a draw or dispatch with this state needs up to the call
 // itself. They return false if it cannot be done, having said why in the log,
@@ -77,5 +78,5 @@ void Dx12ShimForgetPipelines(UINT64 id);
 D3D12_CPU_DESCRIPTOR_HANDLE Dx12ShimDefaultSampler();
 
 // A view of nothing, of the dimension a shader declares (ShimShader::srv_dimension)
-void Dx12ShimNullSrv(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle);
-void Dx12ShimNullUav(BYTE dimension, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+bool Dx12ShimNullSrv(BYTE dimension, UINT16 buffer, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+bool Dx12ShimNullUav(BYTE dimension, UINT16 buffer, D3D12_CPU_DESCRIPTOR_HANDLE handle);

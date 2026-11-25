@@ -18,20 +18,21 @@ public:
 // Copy CPU memory into a resource of ours. For a texture the data is one
 // whole subresource with rows row_pitch apart. A resource that is evicted and
 // cannot be made resident now keeps the write in deferred_writes.
-bool ShimWriteBuffer(ShimResource *resource, UINT64 offset, const void *data, UINT64 size);
+bool ShimWriteBuffer(ShimResource *resource, UINT64 offset, const void *data, UINT64 size, bool allow_defer = true);
 // Gives a buffer that only had its contents in CPU memory a resource with
 // those contents, for the GPU to write to
 bool ShimBufferToGpu(ShimResource *resource);
 // Before a list of ours reads the resource of a buffer: one marked as
 // upload_pending is written what its shadow holds
 void ShimUploadShadow(ShimResource *resource);
-bool ShimWriteSubresource(ShimResource *resource, UINT subresource, const void *data, UINT row_pitch, UINT slice_pitch);
+bool ShimWriteSubresource(ShimResource *resource, UINT subresource, const void *data, UINT row_pitch, UINT slice_pitch,
+		bool allow_defer = true);
 // How subresource 0 lies in an upload, as GetCopyableFootprints says. Any of
 // the four may be NULL.
 void ShimFootprint(ShimResource *resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT *layout, UINT *rows, UINT64 *row_size, UINT64 *total);
 // Copies the shadow of a texture with write_pending to it. Dx12ShimTransition
 // does, which whatever uses a resource goes through first.
-void ShimFlushWrite(ShimResource *resource);
+bool ShimFlushWrite(ShimResource *resource);
 // Makes the writes kept in deferred_writes. Dx12ShimTransition does, once the
 // resource is resident again. False if some are still kept.
 bool ShimApplyDeferredWrites(ShimResource *resource);
@@ -47,6 +48,25 @@ void ShimTrimSpares();
 void ShimForgetSpares(ShimResource *resource);
 // Adds what the resource takes to dx12_memory, or with -1 takes it away
 void ShimCountResource(ShimResource *resource, int sign);
+
+// While one exists, the resources the shim device creates on this thread are
+// staged (ShimResource::staged), which needs no shim lock
+class Dx12StagingScope
+{
+public:
+	Dx12StagingScope();
+	~Dx12StagingScope();
+};
+bool Dx12IsShimDevice(ID3D11Device *device);
+bool Dx12ShimBufferDesc(const D3D11_BUFFER_DESC &buffer, D3D12_RESOURCE_DESC *desc);
+// With the shim lock held. Returns whether the resource is ready to publish.
+// Allow an indivisible copy larger than the budget only to make progress in
+// a frame that has recorded no staged copies yet.
+bool Dx12ShimCommitStaged(ID3D11Resource *resource, UINT64 budget, bool force_progress, UINT64 *recorded);
+// The upload memory a staged resource holds until it is committed, 0 for
+// none. Without the shim lock only for a resource this thread has just made
+// and not shared yet.
+UINT64 Dx12ShimStagedUploadBytes(ID3D11Resource *resource);
 
 // Gives a shader of ours the DXIL it was compiled to as well, see
 // ShimShader::dxil_form

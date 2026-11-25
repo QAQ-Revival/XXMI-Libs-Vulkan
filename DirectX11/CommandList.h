@@ -10,10 +10,12 @@
 #include <DirectXMath.h>
 #include <util.h>
 #include <WICTextureLoader.h>
+#include <DDSTextureLoader.h>
 
 #include "DrawCallInfo.h"
 #include "ResourceHash.h"
 #include "HackerInputLayout.h"
+#include "ResourceLoading.h"
 
 // Used to prevent typos leading to infinite recursion (or at least overflowing
 // the real stack) due to a section running itself or a circular reference. 64
@@ -244,7 +246,7 @@ public:
 
 	bool SetSourceCommandList(CommandList* source);
 	CommandList* ResolveCommandList();
-	bool CommandList::noop();
+	bool noop();
 
 	CommandList() :
 		post(false),
@@ -696,6 +698,41 @@ private:
 	bool warned = false;
 };
 
+// What loading the file of a [Resource] section made, for
+// CustomResource::ApplyFileLoad() to give the section. Holds a reference on
+// resource until then.
+struct CustomResourceFileLoad
+{
+	ID3D11Device *device = nullptr;
+	ID3D11Resource *resource = nullptr;
+	// resource was found among the shared resources rather than made
+	bool reused = false;
+	// The resource is a buffer: the section's format and stride overrides
+	// apply to it
+	bool buffer = false;
+	bool set_buf_size = false;
+	UINT buf_size = 0;
+	// What the section is left with, overrides applied
+	D3D11_BIND_FLAG bind_flags = (D3D11_BIND_FLAG)0;
+	D3D11_RESOURCE_MISC_FLAG misc_flags = (D3D11_RESOURCE_MISC_FLAG)0;
+	// Made from the file, and to be put in the registry of shared
+	// resources once applied
+	bool share = false;
+	SharedResourceKey share_key;
+	FileIdentity identity;
+	// Set by the loader thread of ModLoading.h: a large 2D texture from a DDS
+	// file or a large buffer is then made without its contents, which are
+	// left in subresources, pointing into contents
+	bool may_defer_contents = false;
+	std::unique_ptr<FileContents> contents;
+	std::vector<D3D11_SUBRESOURCE_DATA> subresources;
+
+	CustomResourceFileLoad() {}
+	~CustomResourceFileLoad();
+	CustomResourceFileLoad(const CustomResourceFileLoad&) = delete;
+	CustomResourceFileLoad& operator=(const CustomResourceFileLoad&) = delete;
+};
+
 class CustomResource
 {
 public:
@@ -727,10 +764,18 @@ public:
 
 	wstring filename;
 	bool substantiated;
+	// A ModLoadState (ModLoading.h), changed with Interlocked functions
+	volatile LONG load_state;
+	// Given its resource by the loader of ModLoading.h, with the flags its
+	// uses were expected to need rather than those of its first use
+	bool async_loaded;
+	// How the loader of ModLoading.h reaches it, for the log of a load on use
+	unsigned char load_reach;
 	// Set while parsing for every resource some command list assigns,
 	// copies or clears into. Such a resource may not share a GPU resource
 	// loaded from a file with another section, see ShareableFromFile():
 	bool written_by_command_list;
+	unsigned command_list_assignments = 0;
 
 	// Used to override description when copying or synthesise resources
 	// from scratch:
@@ -766,6 +811,7 @@ public:
 	void SetHandleInfo(ID3D11Resource* source, size_t offset, size_t data_size);
 	ResourceHandleInfo* GetHandleInfo();
 	void Substantiate(ID3D11Device *mOrigDevice, D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags);
+	bool DeclaredTypedBuffer(D3D11_BUFFER_DESC *desc);
 	void OverrideBufferDesc(D3D11_BUFFER_DESC *desc);
 	void OverrideTexDesc(D3D11_TEXTURE1D_DESC *desc);
 	void OverrideTexDesc(D3D11_TEXTURE2D_DESC *desc);
@@ -775,20 +821,31 @@ public:
 	void CopyMetadataFrom(const CustomResource& src);
 	void expire(ID3D11Device *mOrigDevice1, ID3D11DeviceContext *mOrigContext1);
 
+	// Loads filename with the given flags into load, without changing the
+	// section, so that the loader thread can do it while the section is in
+	// use. Reads only what parsing the config set.
+	void LoadFile(ID3D11Device *mOrigDevice, D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags,
+			CustomResourceFileLoad *load);
+	// Gives the section what LoadFile() made
+	void ApplyFileLoad(CustomResourceFileLoad *load);
+
 private:
 	bool HasPNGsRGBChunk(const uint8_t *data, size_t size);
 	DirectX::WIC_LOADER_FLAGS GetWICFlags(const uint8_t *data, size_t size);
 	bool WICFlagsWithoutData(DirectX::WIC_LOADER_FLAGS *flags);
+	DirectX::DDS_LOADER_FLAGS GetDDSFlags();
 	// bind_flags are the ones the resource is actually created with, which
 	// for buffers are only known once OverrideBufferDesc() has run:
 	bool ShareableFromFile(D3D11_BIND_FLAG effective_bind_flags);
-	void LoadFromFile(ID3D11Device *mOrigDevice);
-	void LoadBufferFromFile(ID3D11Device *mOrigDevice);
-	void BufferDescForData(D3D11_BUFFER_DESC *desc, DWORD size);
-	bool RetainedBufferFromFile(ID3D11Device *mOrigDevice, const FileIdentity &identity);
-	// share_file is the mapped file the data came from when its GPU
-	// resource may be shared with other sections loading identical data:
-	void SubstantiateBuffer(ID3D11Device *mOrigDevice, const void *data, DWORD size, const FileContents *share_file);
+	void LoadBufferFile(ID3D11Device *mOrigDevice, D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags,
+			CustomResourceFileLoad *load);
+	void BufferDesc(D3D11_BIND_FLAG bind_flags, D3D11_RESOURCE_MISC_FLAG misc_flags, DWORD size, D3D11_BUFFER_DESC *desc);
+	// share_key is set when the buffer may be shared with other sections
+	// loading identical data, and share_file is the file the data came
+	// from then
+	void CreateBuffer(ID3D11Device *mOrigDevice, const D3D11_BUFFER_DESC &desc, const void *data, DWORD size,
+			SharedResourceKey *share_key, const FileContents *share_file, CustomResourceFileLoad *load);
+	void SubstantiateBuffer(ID3D11Device *mOrigDevice);
 	void SubstantiateTexture1D(ID3D11Device *mOrigDevice);
 	void SubstantiateTexture2D(ID3D11Device *mOrigDevice);
 	void SubstantiateTexture3D(ID3D11Device *mOrigDevice);
@@ -1132,12 +1189,17 @@ struct MemberArg
 		Filter,
 	};
 
+	MemberArg();
+	~MemberArg();
+	MemberArg(MemberArg&&) noexcept;
+	MemberArg& operator=(MemberArg&&) noexcept;
+
 	Type type = Type::None;
 
 	unique_ptr<CommandListExpression> expression;
 
 	std::wstring constant_string;
-	uint64_t constant_hash;
+	uint64_t constant_hash = 0;
 	std::unique_ptr<ResourceCopyTarget> resource;
 	std::unique_ptr<ResourceFilterTarget> filter;
 
@@ -1254,24 +1316,29 @@ class ResourceCopyTarget : public SyntaxTarget
 public:
     using MemberInfo = SyntaxTarget::MemberInfo<ResourceCopyTargetEvaluationMode>;
 
+	ResourceCopyTarget();
+	~ResourceCopyTarget();
+	ResourceCopyTarget(ResourceCopyTarget&&) noexcept;
+	ResourceCopyTarget& operator=(ResourceCopyTarget&&) noexcept;
+
 	ResourceCopyTargetType type = ResourceCopyTargetType::INVALID;
 	ResourceCopyTargetEvaluationMode evaluation_mode = ResourceCopyTargetEvaluationMode::RESOURCE;
 	wchar_t shader_type = L'\0';
 	unsigned slot = 0;
 
 	CustomResourcePool* custom_resource_pool = nullptr;
-	std::unique_ptr<CommandListExpression> pool_dynamic_index_expression = nullptr;
+	std::unique_ptr<CommandListExpression> pool_dynamic_index_expression;
 
 	// Pipeline slot given as an expression (ps-t[$i]); slot is resolved
 	// at runtime and must stay below max_slot:
-	std::unique_ptr<CommandListExpression> slot_expression = nullptr;
+	std::unique_ptr<CommandListExpression> slot_expression;
 	unsigned max_slot = 0;
 
 	// Inclusive bounds for SLOT_RANGE (ps-t[$a:$b]) and POOL_RANGE
 	// (PoolFoo[$a:$b]) targets. Null for a bare "ps-t" / "PoolFoo" side,
 	// which inherits the other side's bounds:
-	std::unique_ptr<CommandListExpression> range_start = nullptr;
-	std::unique_ptr<CommandListExpression> range_end = nullptr;
+	std::unique_ptr<CommandListExpression> range_start;
+	std::unique_ptr<CommandListExpression> range_end;
 
 	ResourceFilter* slot_filter = nullptr;
 
@@ -1292,6 +1359,8 @@ public:
 	unsigned RangeLimit();
 
 	void SetCustomResource(CustomResource* resource);
+	// The section a target names, not one picked from a pool
+	CustomResource* StaticCustomResource() const { return static_custom_resource; }
 
 	template<typename StaticT, typename Getter>
 	StaticT* GetPoolObject(StaticT* static_object, CommandListState* state, bool is_assignment, Getter getter);
@@ -2154,6 +2223,7 @@ public:
 	bool pre_finalised, post_finalised;
 	bool has_nested_else_if;
 	wstring section;
+	const struct PresentLoad *present_load = nullptr;
 
 	bool static_evaluated = false;
 	bool is_static = false;
@@ -2284,11 +2354,11 @@ public:
 	CommandListExpression args[5];
 	ResourceCopyTarget indirect_buffer;
 
-	DrawCommand::DrawCommand() :
+	DrawCommand() :
 		type(DrawCommandType::INVALID)
 	{}
 
-	void do_indirect_draw_call(CommandListState *state, char *name,
+	void do_indirect_draw_call(CommandListState *state, const char *name,
 		void (__stdcall ID3D11DeviceContext::*IndirectDrawCall)(THIS_
 		ID3D11Buffer *pBufferForArgs,
 		UINT AlignedByteOffsetForArgs));

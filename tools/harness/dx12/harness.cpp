@@ -14,6 +14,8 @@
 // Prints the median frame time of the frames after the first 300.
 //   dump=file.bmp  the last frame as a picture and its checksum
 //   capture=N,...  report pictures at these zero-based frames without BMP files
+//   pause=N,MS  pause before recording frame N and report when drawing resumes
+//   min-ms=MS   keep drawing for at least MS milliseconds
 //   key=VK         a key press the shim sees at frame keyframe
 //   uploads, churn the buffers handed out from the upload ring each frame
 //   table=N        SRVs in the pixel shaders' table; heap=N its shader visible heap
@@ -133,6 +135,20 @@ static bool test;
 // records an upload of other positions there but is executed last, and the
 // first list draws A from there in between (A hidden with passes=1).
 static bool move_test;
+// side: from frame SIDE_FROM the first list goes to a second direct queue,
+// handed after a wait for a fence only the CPU signals (once the list was
+// handed) and a signal the swap chain's queue waits for, as WWMI's second
+// direct queue was seen to do. The mods' work for the list is on the swap
+// chain's queue after that wait, and the picture has to be the one without
+// side. Only the swap chain's queue may write its buffers, so the frame is
+// drawn to side_target and copied to the swap chain's buffer by the second
+// list.
+static bool side_test;
+const UINT SIDE_FROM = 300;
+static ID3D12Resource *side_target;
+static ID3D12CommandQueue *side_queue;
+static ID3D12Fence *side_fence;
+static ID3D12Fence *side_cpu_fence;
 static ID3D12Resource *race_uploads[4];
 static ID3D12CommandAllocator *race_allocators[4];
 static ID3D12GraphicsCommandList *race_lists[4];
@@ -759,6 +775,60 @@ static void draw_probe_shader(ID3D12GraphicsCommandList *list)
 	list->DrawInstanced(3, 1, 0, 0);
 }
 
+// stream: the game's pipelines are made from a pipeline state stream laid out
+// the way Unreal Engine 4 lays out its own, with subobjects whose values are
+// not pointer aligned (blend, depth/stencil, sample mask) followed by others
+static bool stream_pipelines;
+
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, class T>
+struct alignas(void*) StreamPart {
+	D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+	T value = {};
+};
+
+static void create_game_pipeline(const D3D12_GRAPHICS_PIPELINE_STATE_DESC &desc, ID3D12PipelineState **pipeline)
+{
+	struct {
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root_signature;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, D3D12_INPUT_LAYOUT_DESC> input_layout;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_SHADER_BYTECODE> vs;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1> depth_stencil;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, DXGI_FORMAT> depth_stencil_format;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rasterizer;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> render_targets;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample_desc;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
+		StreamPart<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, UINT> node_mask;
+	} stream;
+	ID3D12Device2 *device2;
+
+	if (!stream_pipelines) {
+		CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(pipeline)));
+		return;
+	}
+	stream.root_signature.value = desc.pRootSignature;
+	stream.input_layout.value = desc.InputLayout;
+	stream.topology.value = desc.PrimitiveTopologyType;
+	stream.vs.value = desc.VS;
+	stream.ps.value = desc.PS;
+	stream.blend.value = desc.BlendState;
+	memcpy(&stream.depth_stencil.value, &desc.DepthStencilState, sizeof(desc.DepthStencilState));
+	stream.depth_stencil_format.value = desc.DSVFormat;
+	stream.rasterizer.value = desc.RasterizerState;
+	stream.render_targets.value.NumRenderTargets = desc.NumRenderTargets;
+	memcpy(stream.render_targets.value.RTFormats, desc.RTVFormats, sizeof(desc.RTVFormats));
+	stream.sample_desc.value = desc.SampleDesc;
+	stream.sample_mask.value = desc.SampleMask;
+	stream.node_mask.value = desc.NodeMask;
+	D3D12_PIPELINE_STATE_STREAM_DESC stream_desc = { sizeof(stream), &stream };
+	CHECK(device->QueryInterface(IID_PPV_ARGS(&device2)));
+	CHECK(device2->CreatePipelineState(&stream_desc, IID_PPV_ARGS(pipeline)));
+	device2->Release();
+}
+
 static void create_pipelines()
 {
 	D3D12_DESCRIPTOR_RANGE ranges[2] = {};
@@ -899,7 +969,7 @@ static void create_pipelines()
 		desc.NumRenderTargets = 1;
 		desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 		desc.SampleDesc.Count = 1;
-		CHECK(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipelines[i])));
+		create_game_pipeline(desc, &pipelines[i]);
 		vs->Release();
 		ps->Release();
 	}
@@ -1309,6 +1379,7 @@ static void report_appearances()
 int main(int argc, char **argv)
 {
 	UINT frame_count = 3000, mesh_count = 350, passes = 3, key = 0, key_frame = 0;
+	UINT pause_frame = 0, pause_ms = 0, min_ms = 0;
 	bool load_dll = true, profile = false, profile_present = false, threaded = false, debug = false, gpu_debug = false, dump_sampler = false, probe_converter = false;
 	const char *dump = NULL;
 	std::vector<UINT> capture_frames;
@@ -1328,6 +1399,7 @@ int main(int argc, char **argv)
 
 	for (int a = 1; a < argc; a++) {
 		if (!strncmp(argv[a], "frames=", 7)) frame_count = atoi(argv[a] + 7);
+		else if (!strncmp(argv[a], "min-ms=", 7)) min_ms = strtoul(argv[a] + 7, NULL, 10);
 		else if (!strncmp(argv[a], "meshes=", 7)) mesh_count = atoi(argv[a] + 7);
 		else if (!strcmp(argv[a], "slot=vb0")) scene_on_vb0 = true;
 		else if (!strncmp(argv[a], "scene=", 6)) {
@@ -1350,6 +1422,13 @@ int main(int argc, char **argv)
 		}
 		else if (!strncmp(argv[a], "passes=", 7)) passes = atoi(argv[a] + 7);
 		else if (!strncmp(argv[a], "dump=", 5)) dump = argv[a] + 5;
+		else if (!strncmp(argv[a], "pause=", 6)) {
+			char extra;
+			if (sscanf(argv[a] + 6, "%u,%u%c", &pause_frame, &pause_ms, &extra) != 2 || !pause_ms) {
+				printf("invalid pause: %s\n", argv[a] + 6);
+				return 1;
+			}
+		}
 		else if (!strncmp(argv[a], "capture=", 8)) {
 			const char *at = argv[a] + 8;
 			for (;;) {
@@ -1385,6 +1464,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[a], "dump-sampler-dxil")) dump_sampler = true;
 		else if (!strcmp(argv[a], "no-srv")) no_srv = true;
 		else if (!strcmp(argv[a], "early-depth")) early_depth = true;
+		else if (!strcmp(argv[a], "stream")) stream_pipelines = true;
 		else if (!strcmp(argv[a], "rootconst")) root_constants = true;
 		else if (!strcmp(argv[a], "rootsig11")) root_signature_11 = true;
 		else if (!strcmp(argv[a], "rootsig12")) root_signature_11 = root_signature_12 = true;
@@ -1405,6 +1485,7 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[a], "test")) test = true;
 		else if (!strcmp(argv[a], "evict")) evict_test = true;
 		else if (!strcmp(argv[a], "move")) move_test = true;
+		else if (!strcmp(argv[a], "side")) side_test = true;
 		else if (!strcmp(argv[a], "lowmip")) lowmip_test = true;
 		else if (!strncmp(argv[a], "evictstop=", 10)) evict_stop = atoi(argv[a] + 10);
 		else if (!strncmp(argv[a], "appear=", 7)) appear_frames = atoi(argv[a] + 7);
@@ -1513,7 +1594,7 @@ int main(int argc, char **argv)
 	rtv_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	view_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-	heap_desc.NumDescriptors = BACK_BUFFERS;
+	heap_desc.NumDescriptors = BACK_BUFFERS + 1;
 	CHECK(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&rtv_heap)));
 	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	heap_desc.NumDescriptors = TEXTURES;
@@ -1526,6 +1607,13 @@ int main(int argc, char **argv)
 	for (i = 0; i < BACK_BUFFERS; i++) {
 		CHECK(swap_chain->GetBuffer(i, IID_PPV_ARGS(&back_buffers[i])));
 		device->CreateRenderTargetView(back_buffers[i], NULL, { rtv.ptr + i * rtv_size });
+	}
+	if (side_test) {
+		D3D12_RESOURCE_DESC desc = back_buffers[0]->GetDesc();
+		D3D12_HEAP_PROPERTIES heap = { D3D12_HEAP_TYPE_DEFAULT };
+		CHECK(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE,
+				NULL, IID_PPV_ARGS(&side_target)));
+		device->CreateRenderTargetView(side_target, NULL, { rtv.ptr + BACK_BUFFERS * rtv_size });
 	}
 
 	CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
@@ -1627,6 +1715,14 @@ int main(int argc, char **argv)
 	LARGE_INTEGER previous_end;
 	QueryPerformanceCounter(&previous_end);
 	for (f = 0; f < frame_count; f++) {
+		if (f + 1 == frame_count && previous_end.QuadPart - start.QuadPart < freq.QuadPart * min_ms / 1000)
+			frame_count++;
+		if (pause_ms && f == pause_frame) {
+			Sleep(pause_ms);
+			SYSTEMTIME time;
+			GetLocalTime(&time);
+			printf("resumed [%02u:%02u:%02u.%03u]\n", time.wHour, time.wMinute, time.wSecond, time.wMilliseconds);
+		}
 		int in_window = appear_frames && f >= 300 ? (int)((f - 300) % appear_frames) : -1;
 		visible_group = appear_frames && f >= 300 ? (int)((f - 300) / appear_frames) % appear_groups : -1;
 		if (appear_frames && profile)
@@ -1639,7 +1735,8 @@ int main(int argc, char **argv)
 		D3D12_CPU_DESCRIPTOR_HANDLE cpu_start = cpu_heap->GetCPUDescriptorHandleForHeapStart();
 		D3D12_CPU_DESCRIPTOR_HANDLE gpu_cpu_start = gpu_heap->GetCPUDescriptorHandleForHeapStart();
 		D3D12_GPU_DESCRIPTOR_HANDLE gpu_start = gpu_heap->GetGPUDescriptorHandleForHeapStart();
-		D3D12_CPU_DESCRIPTOR_HANDLE target = { rtv.ptr + index * rtv_size };
+		const bool side = side_test && f >= SIDE_FROM;
+		D3D12_CPU_DESCRIPTOR_HANDLE target = { rtv.ptr + (side ? BACK_BUFFERS : index) * rtv_size };
 		UINT pass;
 
 		while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE)) {
@@ -2088,7 +2185,10 @@ int main(int argc, char **argv)
 			*slot = create_buffer(4096 + ((f + i) % 4) * 4096, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
 		}
 
-		transition(lists[0], back_buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		if (side)
+			transition(lists[0], side_target, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+		else
+			transition(lists[0], back_buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		lists[0]->ClearRenderTargetView(target, clear, 0, NULL);
 
 		auto record_pass = [&](UINT pass) {
@@ -2186,7 +2286,14 @@ int main(int argc, char **argv)
 
 		if (probe_shader && f > 0)
 			draw_probe_shader(lists[1]);
-		transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+		if (side) {
+			transition(lists[1], side_target, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+			transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+			lists[1]->CopyResource(back_buffers[index], side_target);
+			transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+		} else {
+			transition(lists[1], back_buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+		}
 		CHECK(lists[0]->Close());
 		CHECK(lists[1]->Close());
 		if (evict_test) {
@@ -2195,7 +2302,24 @@ int main(int argc, char **argv)
 		}
 		if (move_test && f == 1700)
 			CHECK(queue->Wait(queue2_fence, 1));
-		queue->ExecuteCommandLists(1, (ID3D12CommandList**)&lists[0]);
+		if (side_test && f >= SIDE_FROM) {
+			if (!side_queue) {
+				D3D12_COMMAND_QUEUE_DESC desc = {};
+				desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+				CHECK(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&side_queue)));
+				CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&side_fence)));
+				CHECK(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&side_cpu_fence)));
+			}
+			CHECK(side_queue->Wait(side_cpu_fence, f));
+			CHECK(side_queue->Signal(side_fence, 2 * (UINT64)f));
+			CHECK(queue->Wait(side_fence, 2 * (UINT64)f));
+			side_queue->ExecuteCommandLists(1, (ID3D12CommandList**)&lists[0]);
+			CHECK(side_queue->Signal(side_fence, 2 * (UINT64)f + 1));
+			CHECK(queue->Wait(side_fence, 2 * (UINT64)f + 1));
+			CHECK(side_cpu_fence->Signal(f));
+		} else {
+			queue->ExecuteCommandLists(1, (ID3D12CommandList**)&lists[0]);
+		}
 		if (move_test && f == 1800) {
 			CHECK(queue->Signal(queue2_fence, 2));
 			CHECK(queue2->Wait(queue2_fence, 2));

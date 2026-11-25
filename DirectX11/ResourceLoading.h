@@ -5,52 +5,62 @@
 #include <string>
 #include <unordered_set>
 
-// What identifies the contents of a file without reading it: the file itself,
-// its size, and the times the file system updates on every write. Renaming
-// the file or a folder above it keeps them, so a Mod folder that is renamed
-// stays the same file. Compares unequal after any write, as git's index does.
+// The file a path leads to, as it was when opened: two paths to the same
+// unchanged file give the same identity
 struct FileIdentity
 {
-	uint64_t volume = 0;
+	uint32_t volume = 0;
 	uint64_t index = 0;
 	uint64_t size = 0;
-	int64_t last_write = 0;
-	int64_t change = 0;
+	uint64_t write_time = 0;
+	int64_t change_time = 0;
 
 	bool operator==(const FileIdentity &other) const;
 };
-
-// From an open handle, or by opening the file for its attributes only:
-bool GetFileIdentity(HANDLE file, FileIdentity *identity);
-bool GetFileIdentity(const wchar_t *path, FileIdentity *identity);
 
 // A whole file read into memory. Reading into a buffer kept for the next
 // file is much faster than faulting the pages of a mapped view in one by one
 // while a D3D create call copies from it, and the buffer is warm in the
 // cache for that copy. A file of several MB is read by thread pool threads
-// as well, before the constructor returns.
+// as well, before read() returns.
 class FileContents
 {
 public:
+	FileContents() {}
+	// open() and read()
 	explicit FileContents(const wchar_t *path);
 	~FileContents();
 
 	FileContents(const FileContents&) = delete;
 	FileContents& operator=(const FileContents&) = delete;
+	FileContents(FileContents &&other) noexcept :
+		data(other.data), size(other.size), error(other.error), identity(other.identity),
+		file(other.file), path(other.path), buffer(other.buffer), capacity(other.capacity)
+	{
+		other.data = nullptr;
+		other.size = 0;
+		other.file = INVALID_HANDLE_VALUE;
+		other.buffer = nullptr;
+		other.capacity = 0;
+	}
+
+	// Opens the file and fills in identity, false with error set on failure
+	bool open(const wchar_t *path);
+	// Reads all of the opened file and closes it
+	bool read();
 
 	bool valid() const { return data != nullptr; }
-	// Of the file as read: nothing could write to it while it was open
-	bool identity(FileIdentity *identity) const;
 
 	const uint8_t *data = nullptr;
 	size_t size = 0;
 	DWORD error = 0;
+	FileIdentity identity;
 
 private:
+	HANDLE file = INVALID_HANDLE_VALUE;
+	const wchar_t *path = nullptr;
 	uint8_t *buffer = nullptr;
 	size_t capacity = 0;
-	FileIdentity file_identity;
-	bool has_identity = false;
 };
 
 // Once a frame: frees the buffer of files too big for the kept ones once it
@@ -87,31 +97,34 @@ struct SharedResourceKey
 };
 
 // The registry holds a reference of its own on every shared resource until
-// it is released, so that a hit is never a dangling pointer. A hit means the
-// data is byte for byte identical to the file an earlier resource with the
-// same key was created from, and the returned resource is AddRef()ed for the
-// caller. On a miss the key is complete and can be passed to
-// ShareFileResource(), together with the path of the file, once the resource
-// has been created from the same data. path_identity is that of the file the
-// data came from, when known, so the next config can find it by
-// FindRetainedFileResource().
+// ReleaseSharedFileResources() is called, so that a hit is never a dangling
+// pointer. A hit means the data is byte for byte identical to the file an
+// earlier resource with the same key was created from, and the returned
+// resource is AddRef()ed for the caller. On a miss the key is complete and
+// can be passed to ShareFileResource(), together with the path of the file,
+// once the resource has been created from the same data.
 ID3D11Resource* FindSharedFileResource(SharedResourceKey &key, const void *data, size_t size,
-		const std::wstring *path = nullptr, const FileIdentity *path_identity = nullptr);
-void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, ID3D11Resource *resource,
-		const FileIdentity *path_identity = nullptr);
-
-// The resources survive a config reload, so a Mod that has not changed keeps
-// its textures and buffers instead of loading them from disk again. Given the
-// key without its size and contents (those are implied by the identity), this
-// finds the resource created from this very file, unchanged since, without
-// reading it. A hit is AddRef()ed for the caller.
-ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std::wstring &path,
-		const FileIdentity &identity);
-
-// Called once a reloaded config has parsed every [Resource] section, with the
-// lower case path of each file they load: keeps the resources used since the
-// previous reload whose file is still in the config, and drops the rest.
+		const std::wstring &path, const FileIdentity &identity);
+// Before the file is read: a resource made from this very file, unchanged
+// since, with the same key except for the content, which is left unset.
+// AddRef()ed for the caller.
+ID3D11Resource* FindRetainedFileResource(const SharedResourceKey &key, const std::wstring &path, const FileIdentity &identity);
 void RetainSharedFileResources(const std::unordered_set<std::wstring> &lower_paths);
+// A provisional entry is for a resource that may not be used yet (made on
+// the loader thread of ModLoading.h): only threads inside a
+// SharedProvisionalScope find it. Sharing the same resource again without
+// provisional makes the entry a normal one.
+void ShareFileResource(const SharedResourceKey &key, const std::wstring &path, const FileIdentity &identity,
+		ID3D11Resource *resource, bool provisional = false);
+// Removes the provisional entry of a resource that was never given to its
+// section, if there is one
+void DropProvisionalShare(ID3D11Resource *resource);
+class SharedProvisionalScope
+{
+public:
+	SharedProvisionalScope();
+	~SharedProvisionalScope();
+};
 // Drops the registry's references, all of them or those on one device:
 void ReleaseSharedFileResources(ID3D11Device *device = nullptr);
 

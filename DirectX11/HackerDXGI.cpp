@@ -72,17 +72,16 @@
 #include "profiling.h"
 #include "GpuWatch.h"
 #include "ResourceLoading.h"
-#include "cursor.h" // For InstallHookLate
+#include "ModLoading.h"
 #include "dx12/Bridge.h"
 #include "vk/VkHooks.h"
 #include "desktop/Channel.h"
+#include "ReShadeRuntime.hpp"
 
 
 // -----------------------------------------------------------------------------
 // SetWindowPos hook, activated by full_screen=2 in d3dx.ini
-
-static BOOL(WINAPI *fnOrigSetWindowPos)(_In_ HWND hWnd, _In_opt_ HWND hWndInsertAfter,
-	_In_ int X, _In_ int Y, _In_ int cx, _In_ int cy, _In_ UINT uFlags) = nullptr;
+static decltype(&::SetWindowPos) fnOrigSetWindowPos = nullptr;
 
 static BOOL WINAPI Hooked_SetWindowPos(
 	_In_ HWND hWnd,
@@ -111,26 +110,26 @@ static BOOL WINAPI Hooked_SetWindowPos(
 	return fnOrigSetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
 }
 
-
 void InstallSetWindowPosHook()
 {
-	HINSTANCE hUser32;
-	int fail = 0;
-
 	// Only attempt to hook it once:
 	if (fnOrigSetWindowPos != nullptr)
 		return;
 
-	hUser32 = NktHookLibHelpers::GetModuleBaseAddress(L"User32.dll");
-	fail |= InstallHookLate(hUser32, "SetWindowPos", (void**)&fnOrigSetWindowPos, Hooked_SetWindowPos);
+	HMODULE user32 = GetModuleHandleW(L"user32.dll");
 
-	if (fail) {
+	bool success = QueueHook(user32, "SetWindowPos", Hooked_SetWindowPos, &fnOrigSetWindowPos);
+
+	if (success)
+		success = InstallQueuedHooks();
+
+	if (!success)
+	{
 		LogOverlay(LOG_DIRE, "Failed to hook SetWindowPos for full_screen=2\n");
 		return;
 	}
 
 	LogInfo("Successfully hooked SetWindowPos for full_screen=2\n");
-	return;
 }
 
 // -----------------------------------------------------------------------------
@@ -295,6 +294,7 @@ void HackerSwapChain::RunFrameActions()
 
 	G->gFPSCounter.Update(system_tick_count);
 	ReleaseIdleReadBuffers();
+	ModLoadsFrame(mHackerDevice->GetPassThroughOrigDevice1());
 
 	// Run the command list here, before drawing the overlay so that a
 	// custom shader on the present call won't remove the overlay. Also,
@@ -377,6 +377,8 @@ void HackerSwapChain::RunFrameActions()
 	// incremented when we call the original present call:
 	G->frame_no++;
 	mHackerContext->ResetCallCounters();
+	// The overlay and the desktop channel bind on the context directly:
+	mHackerContext->ForgetGameBindings();
 
 	// When not hunting most keybindings won't have been registered, but
 	// still skip the below logic that only applies while hunting.
