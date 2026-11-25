@@ -8552,7 +8552,7 @@ void CustomResource::LoadFile(ID3D11Device *mOrigDevice1, D3D11_BIND_FLAG bind_f
 		wic_flags = GetWICFlags(file.data, file.size);
 
 	if (share) {
-		share_key.load_flags = dds ? dds_flags : wic_flags;
+		share_key.load_flags = dds ? static_cast<UINT>(dds_flags) : static_cast<UINT>(wic_flags);
 		load->resource = FindSharedFileResource(share_key, file.data, file.size, filename, file.identity);
 		if (load->resource) {
 			LogInfoW(L"Sharing the texture already loaded from identical %s\n", filename.c_str());
