@@ -489,6 +489,8 @@ public:
 
 typedef std::unordered_map<std::wstring, class CustomShader> CustomShaders;
 extern CustomShaders customShaders;
+// Changes each time a config load has compiled the shaders of customShaders
+extern std::atomic<unsigned> custom_shaders_generation;
 
 class RunCustomShaderCommand : public CommandListCommand {
 public:
@@ -1642,6 +1644,7 @@ public:
 // "<stage>-tN = ref ResourceFoo" lines: one XXSetShaderResources
 class ShaderResourceBindBatch : public ShaderResourceBatch {
 public:
+	bool null_only = false;
 	void run(CommandListState*) override;
 };
 

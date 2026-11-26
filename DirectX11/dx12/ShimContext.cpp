@@ -271,24 +271,29 @@ void ShimContext::UnbindInput(const ShimView *output)
 
 void ShimContext::SetShaderResources(Dx12ShaderStage stage, UINT start, UINT count, ID3D11ShaderResourceView *const *views)
 {
-	ShimStageState *state = &mState->stages[stage];
-	ID3D11ShaderResourceView *view;
-	UINT i;
+	ShimStageState &state = mState->stages[stage];
 
-	for (i = 0; i < count && start + i < SHIM_SRV_SLOTS; i++) {
-		view = views ? views[i] : NULL;
+	for (UINT i = 0, slot = start; i < count && slot < SHIM_SRV_SLOTS; i++, slot++) {
+		ID3D11ShaderResourceView *view = views ? views[i] : NULL;
 		if (view && IsOutput(ShimViewOf(view)))
 			view = NULL;
-		assign(state->srvs[start + i], view);
+
+		UINT word = slot / 32;
+		UINT bit = 1u << (slot & 31);
+		// A null pointer alone can still mean the slot inherits the game's view.
+		if (state.srvs[slot] == view && (view || (state.srv_unbound[word] & bit)))
+			continue;
+
+		assign(state.srvs[slot], view);
 		if (view) {
-			state->srv_mask[(start + i) / 32] |= 1u << ((start + i) & 31);
-			state->srv_unbound[(start + i) / 32] &= ~(1u << ((start + i) & 31));
+			state.srv_mask[word] |= bit;
+			state.srv_unbound[word] &= ~bit;
 		} else {
-			state->srv_mask[(start + i) / 32] &= ~(1u << ((start + i) & 31));
-			state->srv_unbound[(start + i) / 32] |= 1u << ((start + i) & 31);
+			state.srv_mask[word] &= ~bit;
+			state.srv_unbound[word] |= bit;
 		}
+		mChanged = true;
 	}
-	mChanged = true;
 }
 
 void ShimContext::GetShaderResources(Dx12ShaderStage stage, UINT start, UINT count, ID3D11ShaderResourceView **views)
@@ -468,6 +473,18 @@ void STDMETHODCALLTYPE ShimContext::IASetVertexBuffers(UINT StartSlot, UINT NumB
 		mState->vb_offsets[StartSlot + i] = pOffsets ? pOffsets[i] : 0;
 	}
 	mChanged = true;
+}
+
+ID3D11Resource *ShimContext::BorrowDx12PixelResource(UINT slot)
+{
+	if (slot >= SHIM_SRV_SLOTS)
+		return NULL;
+	const ShimStageState &state = mState->stages[DX12_STAGE_PS];
+	if (state.srvs[slot])
+		return ShimViewOf(state.srvs[slot])->resource11;
+	if (state.srv_unbound[slot / 32] & (1u << (slot & 31)))
+		return NULL;
+	return Dx12ScopePixelResource(slot);
 }
 
 ID3D11Buffer *ShimContext::BorrowVertexBuffer(UINT slot, UINT *stride, UINT *offset)

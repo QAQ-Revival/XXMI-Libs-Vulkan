@@ -38,6 +38,7 @@ CustomResources customResources;
 CustomResourcePools customResourcePools;
 std::unordered_map<std::wstring, CustomResourcePool*> custom_resource_pool_path_keys;
 CustomShaders customShaders;
+std::atomic<unsigned> custom_shaders_generation;
 ResourceFilters resourceFilters;
 ExplicitCommandListSections explicitCommandListSections;
 CommandListVariables command_list_globals;
@@ -3872,7 +3873,13 @@ float CommandListOperand::process_texture_filter(CommandListState *state)
 			bool resource_found;
 
 			const auto type = texture_filter_target.type;
-			if ((type == ResourceCopyTargetType::RENDER_TARGET || type == ResourceCopyTargetType::DEPTH_STENCIL_TARGET)
+			if (type == ResourceCopyTargetType::SHADER_RESOURCE && texture_filter_target.shader_type == L'p'
+			    && dx12_shim && state->mOrigContext1 == dx12_shim->shim_context && !VkInDrawScope()) {
+				ID3D11Resource *resource = dx12_shim->shim_context->BorrowDx12PixelResource(texture_filter_target.ResolveSlot(state));
+				resource_found = !!resource;
+				if (resource)
+					texture_filter_target.FindTextureOverridesForResource(state, resource, 0, 0, DXGI_FORMAT_UNKNOWN, &matches);
+			} else if ((type == ResourceCopyTargetType::RENDER_TARGET || type == ResourceCopyTargetType::DEPTH_STENCIL_TARGET)
 					&& !(dx12_shim && state->mOrigContext1 == dx12_shim->shim_context) && !VkInDrawScope())
 				resource_found = find_native_output_filter_overrides(texture_filter_target, state, &matches);
 			else
@@ -4010,13 +4017,8 @@ float CommandListOperand::process_shader_filter(CommandListState *state)
 		if (shader_target.shader_type != L'p' || !VkInDrawScope())
 			return -1.0f;
 		UINT slot = (UINT)shader_target.member_args[0].GetValue(state);
-		// Bypass the shim's replacement bindings when identifying a game's material slots.
-		ID3D11ShaderResourceView *view = VkScopeShaderResource(DX12_STAGE_PS, slot);
-		if (!view)
-			return -1.0f;
-		D3D11_SHADER_RESOURCE_VIEW_DESC desc;
-		view->GetDesc(&desc);
-		return desc.Format != DXGI_FORMAT_UNKNOWN ? (float)desc.Format : -1.0f;
+		DXGI_FORMAT format = VkScopeOriginalPixelFormat(slot);
+		return format != DXGI_FORMAT_UNKNOWN ? (float)format : -1.0f;
 	}
 
 	HackerContext *mHackerContext = state->mHackerContext;
@@ -9394,11 +9396,13 @@ size_t CustomResourcePool::GetElementIndex(float id, bool use_ring_index, bool i
 	case PoolIndexType::FIFO:
 	{
 		// UID-based rolling FIFO indexing:
-		// 
-		// - New UIDs are assigned the next pool slot.
+		//
+		// - New UIDs take an unassigned slot (never used or expired) first.
 		// - Existing UIDs keep their assigned slot.
-		// - When the pool is full, the oldest slot assignment is overwritten.
-		// 
+		// - When every slot is assigned, the oldest slot assignment is overwritten.
+		//   With expiration, the least recently updated slot is overwritten instead,
+		//   so UIDs updated every frame stay mapped.
+		//
 		// For pool_size of 2 [ResourcePoolFoo_0, ResourcePoolFoo_1]:
 		//   ResourcePoolFoo[11] -> ResourcePoolFoo_0 (pool_index 0)
 		//   ResourcePoolFoo[22] -> ResourcePoolFoo_1 (pool_index 1)
@@ -9421,9 +9425,34 @@ size_t CustomResourcePool::GetElementIndex(float id, bool use_ring_index, bool i
 		if (!allocate_slot_on_missing && !is_assignment)
 			return SIZE_MAX;
 
-		// Allocate next FIFO slot
-		pool_index = (last_replacement_index + 1) % pool_size;
-		last_replacement_index = pool_index;
+		pool_index = SIZE_MAX;
+		if (index_map->size() < pool_size)
+		{
+			for (size_t i = 1; i <= pool_size; ++i)
+			{
+				size_t slot = (last_replacement_index + i) % pool_size;
+				if (index_table[slot].key == UINT32_MAX)
+				{
+					pool_index = slot;
+					break;
+				}
+			}
+		}
+
+		if (pool_index == SIZE_MAX)
+		{
+			pool_index = (last_replacement_index + 1) % pool_size;
+			if (expiration_timeout_frames != UINT32_MAX)
+			{
+				for (size_t i = 2; i <= pool_size; ++i)
+				{
+					size_t slot = (last_replacement_index + i) % pool_size;
+					if (index_table[slot].last_update_frame < index_table[pool_index].last_update_frame)
+						pool_index = slot;
+				}
+			}
+			last_replacement_index = pool_index;
+		}
 
 		AssignSlot(pool_index, key, is_assignment);
 
@@ -15855,6 +15884,14 @@ static void SetShaderResourcesBatch(ID3D11DeviceContext1 *context, wchar_t shade
 void ShaderResourceBindBatch::run(CommandListState *state)
 {
 	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_BINDINGS);
+	if (null_only && !G->analyse_frame && gLogVerbosity < LogVerbosity::DEBUG) {
+		static ID3D11ShaderResourceView *const null_views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+		SetShaderResourcesBatch(state->mOrigContext1, shader_type, first_slot, count, null_views);
+		for (unsigned i = 0; i < count; i++)
+			state->mHackerContext->NoteCommandListSrv(shader_type, first_slot + i, false);
+		return;
+	}
+
 	ID3D11ShaderResourceView *views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
 
 	// Only the slots of the batch are looked at:
@@ -16306,6 +16343,11 @@ static void emit_slot_batch(const std::vector<std::shared_ptr<ResourceCopyOperat
 	batch->first_slot = first;
 	batch->count = last - first + 1;
 	batch->prefetch_current_bindings = prefetch_current_bindings;
+	if (direction == BatchDirection::Bind && !prefetch_current_bindings)
+		static_cast<ShaderResourceBindBatch*>(batch.get())->null_only =
+			std::all_of(batch->operations.begin(), batch->operations.end(), [](const auto &op) {
+				return op->src.type == ResourceCopyTargetType::EMPTY;
+			});
 	// Shown in the frame analysis log in place of the individual lines:
 	batch->ini_line = batch->operations[0]->ini_line + L" ... +" + std::to_wstring(batch->operations.size() - 1);
 	out.push_back(batch);
