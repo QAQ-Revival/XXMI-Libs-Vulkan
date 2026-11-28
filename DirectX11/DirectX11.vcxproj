@@ -105,7 +105,6 @@
     <ClCompile Include="profiling.cpp" />
     <ClCompile Include="ResourceHash.cpp" />
     <ClCompile Include="ResourceLoading.cpp" />
-    <ClCompile Include="ModLoading.cpp" />
     <ClCompile Include="ShaderRegex.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -195,7 +194,6 @@
     <ClInclude Include="ResourceHash.h" />
     <ClInclude Include="ResourceLoading.h" />
     <ClInclude Include="IniText.h" />
-    <ClInclude Include="ModLoading.h" />
     <ClInclude Include="ShaderRegex.h" />
     <ClInclude Include="..\vkeys.h" />
   </ItemGroup>
